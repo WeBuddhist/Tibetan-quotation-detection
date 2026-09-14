@@ -1,0 +1,27 @@
+# Corpus and derived caches - regenerable, canonical copies live on the HF Hub
+Data/
+
+# Training checkpoints / Trainer outputs
+experiments/*/outputs/
+
+# Per-book tokenized window cache (regenerable)
+experiments/*/window_cache/
+window_cache/
+
+# Local Python env + editable install metadata
+venv/
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Run logs and local eval caches
+wandb/
+*.eval_cache_val/
+outputs/*_logit_cache/
+
+# Third-party checkouts (DharmaBench etc.)
+third_party/
+
+# macOS
+.DS_Store

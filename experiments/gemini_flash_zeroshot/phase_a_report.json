@@ -1,0 +1,72 @@
+{
+  "dataset_revision": "v1.1",
+  "T_38": 2.0,
+  "T_37": 2.0,
+  "L": 1078,
+  "W": 2156,
+  "S": 1078,
+  "percentiles": {
+    "QUOTATION": {
+      "p50": 114.0,
+      "p95": 376.0,
+      "p99": 746.1200000000026,
+      "max": 4392
+    },
+    "TSAWA": {
+      "p50": 136.0,
+      "p95": 377.0,
+      "p99": 845.7600000000002,
+      "max": 2924
+    },
+    "YIGCHUNG": {
+      "p50": 28.0,
+      "p95": 413.25,
+      "p99": 1078.7999999999993,
+      "max": 4339
+    }
+  },
+  "tail_counts": {
+    "QUOTATION": 92,
+    "TSAWA": 41,
+    "YIGCHUNG": 72
+  },
+  "verification_passed": true,
+  "books_verified": [
+    {
+      "book_id": "P000010",
+      "text_len": 657140,
+      "chunks_count": 609,
+      "checks": {
+        "identity": true,
+        "coverage": true,
+        "guarantee": true,
+        "round_trip": true
+      },
+      "uncovered_spans_count": 0
+    },
+    {
+      "book_id": "P000025",
+      "text_len": 335262,
+      "chunks_count": 310,
+      "checks": {
+        "identity": true,
+        "coverage": true,
+        "guarantee": true,
+        "round_trip": true
+      },
+      "uncovered_spans_count": 0
+    },
+    {
+      "book_id": "P000030",
+      "text_len": 761197,
+      "chunks_count": 705,
+      "checks": {
+        "identity": true,
+        "coverage": true,
+        "guarantee": true,
+        "round_trip": true
+      },
+      "uncovered_spans_count": 0
+    }
+  ]
+}

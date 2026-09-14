@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quotation-detection"
+version = "0.1.0"
+description = "Tibetan quotation span detection - mmBERT fine-tuning, windowing, and Gemini/Claude LLM benchmarks."
+requires-python = ">=3.10"
+
+[project.scripts]
+quotation-windows = "layer_detection.quotation_windows:main"
+quotation-bioe = "layer_detection.quotation_bioe:main"
+quotation-benchmark = "layer_detection.quotation_benchmark:main"
+gemini-benchmark = "layer_detection.gemini_benchmark:main"
+layer-window-cache = "layer_detection.upload_window_cache:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
