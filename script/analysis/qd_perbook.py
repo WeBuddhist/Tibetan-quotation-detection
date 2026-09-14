@@ -1,7 +1,7 @@
 import re, csv, json, sys
 from pathlib import Path
 
-ROOT = Path.home()/"mnt"/"quotation_detection"
+ROOT = Path(__file__).resolve().parents[2]
 REPOS = ROOT/"Data"/"repos"
 LAYERS = ("Quotation","Sabche","Tsawa","Yigchung","Chapter","Author","BookTitle")
 BLOCK = re.compile(r"^  (?P<i>[a-f0-9]+):\n    span:\n      start: (?P<s>-?\d+)\n      end: (?P<e>-?\d+)", re.M)

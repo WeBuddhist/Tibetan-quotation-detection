@@ -1,7 +1,7 @@
 """Final sweep: quote SOURCE TYPE from རྣམ་དབྱེ་, clean-boundary spans only."""
 import re, csv, collections, statistics as st, math, random
 from pathlib import Path
-ROOT=Path.home()/"mnt"/"quotation_detection"; REPOS=ROOT/"Data"/"repos"; OUT=ROOT/"Data"/"audit"/"quotation_tags"
+ROOT=Path(__file__).resolve().parents[2]; REPOS=ROOT/"Data"/"repos"; OUT=ROOT/"Data"/"audit"/"quotation_tags"
 BLOCK=re.compile(r"^  (?P<i>[a-f0-9]+):\n    span:\n      start: (?P<s>-?\d+)\n      end: (?P<e>-?\d+)",re.M)
 split={r["book"]:r["split"] for r in csv.DictReader(open(ROOT/"Data/audit/split.csv"))}
 DELIM="་༌ \n\r།༎༏༑༈༔༴༵༶྅"; SP=re.compile("["+re.escape(DELIM)+"]+"); PUN=set(DELIM); TS="་"

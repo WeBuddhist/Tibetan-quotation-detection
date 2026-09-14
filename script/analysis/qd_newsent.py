@@ -1,7 +1,7 @@
 """Does the quotation start a NEW sentence (after །)? And what ended that previous sentence?"""
 import re, csv, collections, random
 from pathlib import Path
-ROOT=Path.home()/"mnt"/"quotation_detection"; REPOS=ROOT/"Data"/"repos"
+ROOT=Path(__file__).resolve().parents[2]; REPOS=ROOT/"Data"/"repos"
 BLOCK=re.compile(r"^  (?P<i>[a-f0-9]+):\n    span:\n      start: (?P<s>-?\d+)\n      end: (?P<e>-?\d+)",re.M)
 split={r["book"]:r["split"] for r in csv.DictReader(open(ROOT/"Data/audit/split.csv"))}
 TSHEG=set("་༌"); SHAD=set("།༎༏༑༈༔༴༵༶"); WS=set(" \t\n\r ")

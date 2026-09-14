@@ -1,7 +1,7 @@
 """Mine candidate opener/closer markers from TRAIN books only, by enrichment."""
 import re, csv, json, collections, random
 from pathlib import Path
-ROOT=Path.home()/"mnt"/"quotation_detection"; REPOS=ROOT/"Data"/"repos"
+ROOT=Path(__file__).resolve().parents[2]; REPOS=ROOT/"Data"/"repos"
 BLOCK=re.compile(r"^  (?P<i>[a-f0-9]+):\n    span:\n      start: (?P<s>-?\d+)\n      end: (?P<e>-?\d+)",re.M)
 split={r["book"]:r["split"] for r in csv.DictReader(open(ROOT/"Data/audit/split.csv"))}
 PUNCT=re.compile(r"^[\s།༎༏༑༈]+")      # leading shad / spaces / newlines

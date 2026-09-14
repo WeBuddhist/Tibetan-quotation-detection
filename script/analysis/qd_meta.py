@@ -1,6 +1,6 @@
 import yaml, json
 from pathlib import Path
-ROOT=Path.home()/"mnt"/"quotation_detection"/"Data"/"repos"
+ROOT=Path(__file__).resolve().parents[2]/"Data"/"repos"
 out={}
 for bd in sorted(ROOT.iterdir()):
     if not bd.is_dir(): continue

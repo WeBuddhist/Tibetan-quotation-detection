@@ -1,6 +1,6 @@
 import csv, json, collections, statistics as st, random
 from pathlib import Path
-ROOT=Path.home()/"mnt"/"quotation_detection"
+ROOT=Path(__file__).resolve().parents[2]
 prof={r["book"]:r for r in csv.DictReader(open(ROOT/"Data/audit/quotation_tags/book_top3_profile.csv"))}
 exec(open('qd/series.py').read())
 per={r["book"]:r for r in json.load(open('qd/perbook.json'))}
