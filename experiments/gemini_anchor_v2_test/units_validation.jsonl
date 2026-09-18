@@ -8,7 +8,8 @@
 {"book_id": "I6380CEC4", "piece": 0, "start": 0, "end": 207607, "sha1": "295aaacb04b92a432def44d85f903987470f503d"}
 {"book_id": "I6380CEC4", "piece": 1, "start": 205592, "end": 413240, "sha1": "4f02df526857a57321e2b367c3faefe0897c8370"}
 {"book_id": "I8006C360", "piece": 0, "start": 0, "end": 66302, "sha1": "1bfe1d98f0a5153d6973aa4aaaf8c2ceaaab7f26"}
-{"book_id": "I9B6A4525", "piece": 0, "start": 0, "end": 246392, "sha1": "81f55bda8f36e59b5ab95af33db997ea7eb21ffe"}
+{"book_id": "I9B6A4525", "piece": 0, "start": 0, "end": 123212, "sha1": "03d3501af0ecd3459c7e1ece4d59292e647503d1"}
+{"book_id": "I9B6A4525", "piece": 1, "start": 121145, "end": 246392, "sha1": "cf4dbab0d22bd5610164e63f0dab5673aa1fb533"}
 {"book_id": "IAE1E11E5", "piece": 0, "start": 0, "end": 150336, "sha1": "100a6bb011d7077852dd999edaef4bba6abd48cb"}
 {"book_id": "IB47565DE", "piece": 0, "start": 0, "end": 138796, "sha1": "7a7c40935e3d244b06630220fdfc9b51617197ea"}
 {"book_id": "IB47565DE", "piece": 1, "start": 136793, "end": 275566, "sha1": "dabfce92bca714297d61a57087c64b0f2ecda1e0"}

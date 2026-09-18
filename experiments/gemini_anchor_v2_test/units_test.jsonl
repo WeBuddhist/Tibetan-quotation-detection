@@ -4,7 +4,8 @@
 {"book_id": "I27E347E9", "piece": 0, "start": 0, "end": 202460, "sha1": "ab63043b6e65509b988dddd77b93038af6a1d356"}
 {"book_id": "I27E347E9", "piece": 1, "start": 200211, "end": 402984, "sha1": "bb625f24c1814646c5e5e04eec7423000f89ebb5"}
 {"book_id": "I44B84506", "piece": 0, "start": 0, "end": 209052, "sha1": "77accab6a48be18bc3891f9425cc4bc1bb55286c"}
-{"book_id": "I88977D82", "piece": 0, "start": 0, "end": 244713, "sha1": "695511d9fd1681b71578727cfc843824e02cf40e"}
+{"book_id": "I88977D82", "piece": 0, "start": 0, "end": 122326, "sha1": "44600e7b44270e041d194cfe889effb81213d304"}
+{"book_id": "I88977D82", "piece": 1, "start": 120270, "end": 244713, "sha1": "f41e9fa8d9d963e8f4022bc3288af2c50b30bf57"}
 {"book_id": "I97B90DC0", "piece": 0, "start": 0, "end": 151852, "sha1": "5d092d8790b5de546f9d964cc905ca4ffd5c57a1"}
 {"book_id": "I97B90DC0", "piece": 1, "start": 149841, "end": 301570, "sha1": "15a2b4fc6250fb120617de1e1f20be6da618db7f"}
 {"book_id": "IA736981A", "piece": 0, "start": 0, "end": 58044, "sha1": "46f3bf88db07c9dcc36b5c88598b900b3ff1c867"}
@@ -15,8 +16,10 @@
 {"book_id": "IE3ACE254", "piece": 1, "start": 187180, "end": 376437, "sha1": "fdc8516fd6e4c6d5b1346df7bac503f3fcca36b8"}
 {"book_id": "IE3ACE254", "piece": 2, "start": 374437, "end": 563699, "sha1": "4dc635d5e6722e107857a17b54b4dcd8f7b12644"}
 {"book_id": "IE3ACE254", "piece": 3, "start": 561696, "end": 751000, "sha1": "70b921f8e63f57f6d7ff162f5e3a0829bc91839b"}
-{"book_id": "IE5895799", "piece": 0, "start": 0, "end": 247282, "sha1": "83deb38c54120c3f248df1df05c6efb6d9b2e02f"}
-{"book_id": "P000038", "piece": 0, "start": 0, "end": 245197, "sha1": "de2a796e2c78f52d7b692e8115d81cbf0ea89f92"}
+{"book_id": "IE5895799", "piece": 0, "start": 0, "end": 123614, "sha1": "af2537db46d00f42969ed95486b7ae0fe22e5773"}
+{"book_id": "IE5895799", "piece": 1, "start": 121575, "end": 247282, "sha1": "174ef018118772ce693a9140231ccb1a0667f5fc"}
+{"book_id": "P000038", "piece": 0, "start": 0, "end": 122546, "sha1": "bfbab6d5ca1213796cd54981d9c339b11439993f"}
+{"book_id": "P000038", "piece": 1, "start": 120514, "end": 245197, "sha1": "b133848b06f002fd4018c8b56b6b3f799d470f78"}
 {"book_id": "P000084", "piece": 0, "start": 0, "end": 152131, "sha1": "73b98252a35634c09c6565a6a3380e2f9c7c3419"}
 {"book_id": "P000099", "piece": 0, "start": 0, "end": 238013, "sha1": "1e03384a5044fd67e797b5695e1576b4e945fe9e"}
 {"book_id": "P000149", "piece": 0, "start": 0, "end": 150357, "sha1": "6ab242493d447171fb504e2d812d444cd47b2fd2"}

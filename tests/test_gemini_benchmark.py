@@ -11,7 +11,15 @@ from layer_detection.gemini_benchmark import (
     update_ledger,
     get_sha1,
     cmd_locate,
-    evaluate_predictions
+    evaluate_predictions,
+    classify_gemini_run_error,
+    next_server_wait_seconds,
+    unit_failure_action,
+    write_retry_list,
+    count_gemini_tokens,
+    COUNT_TOKEN_RETRY_WAIT_SECONDS,
+    is_cached_complete,
+    normalize_finish_reason,
 )
 
 # --------------------------------------------------------------------------- #
@@ -127,10 +135,85 @@ def test_update_ledger_limit(tmp_path):
 # 4. PerDay 429 Dispatch Test
 # --------------------------------------------------------------------------- #
 
-def test_perday_dispatch():
-    # If PerDay error is received, the run stops with clear exit
-    # Checked inside cmd_run implementation where Exception handling checks "perday" and exits
-    pass
+class _FakeAPIError(Exception):
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+
+
+def test_classify_gemini_run_error_kinds():
+    overloaded = _FakeAPIError(
+        "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand.', 'status': 'UNAVAILABLE'}}",
+        code=503,
+    )
+    assert classify_gemini_run_error(overloaded) == "server"
+    assert classify_gemini_run_error(_FakeAPIError("429 RESOURCE_EXHAUSTED PerDay quota", code=429)) == "daily"
+    assert classify_gemini_run_error(_FakeAPIError("429 RESOURCE_EXHAUSTED PerMinute quota", code=429)) == "rate"
+    assert classify_gemini_run_error(_FakeAPIError("400 INVALID_ARGUMENT", code=400)) == "bad_request"
+
+
+def test_unit_failure_action_defers_503_instead_of_raising():
+    assert unit_failure_action("server", 4, second_pass=False) == "wait_server"
+    assert unit_failure_action("server", 5, second_pass=False) == "defer"
+    assert unit_failure_action("server", 5, second_pass=True) == "give_up"
+    assert unit_failure_action("daily", 1, second_pass=False) == "stop_daily"
+    assert unit_failure_action("bad_request", 1, second_pass=False) == "stop_bad_request"
+    assert unit_failure_action("rate", 8, second_pass=False) == "wait_rate"
+
+
+def test_next_server_wait_seconds_backoff():
+    assert next_server_wait_seconds(1, jitter=0.0) == 30.0
+    assert next_server_wait_seconds(2, jitter=0.0) == 60.0
+    assert next_server_wait_seconds(3, jitter=0.0) == 120.0
+    assert next_server_wait_seconds(4, jitter=0.0) == 240.0
+    assert next_server_wait_seconds(5, jitter=0.0) == 240.0
+
+
+def test_write_retry_list_strips_pass_marker(tmp_path):
+    path = tmp_path / "retry_validation.jsonl"
+    write_retry_list(path, [{"book_id": "I6380CEC4", "piece": 0, "start": 0, "end": 10, "_retry_pass": True}])
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["book_id"] == "I6380CEC4"
+    assert "_retry_pass" not in saved
+
+
+def test_count_gemini_tokens_retries_timeout_after_a_minute():
+    timeout = Exception("[Errno 60] Operation timed out")
+    ok = MagicMock(total_tokens=16143)
+    client = MagicMock()
+    client.models.count_tokens.side_effect = [timeout, timeout, ok]
+
+    with patch("layer_detection.gemini_benchmark.time.sleep") as mock_sleep:
+        tokens = count_gemini_tokens(client, "gemini-3.1-flash-lite", "prompt")
+
+    assert tokens == 16143
+    assert client.models.count_tokens.call_count == 3
+    assert mock_sleep.call_count == 2
+    for call in mock_sleep.call_args_list:
+        assert call.args[0] == COUNT_TOKEN_RETRY_WAIT_SECONDS
+
+
+def test_count_gemini_tokens_raises_bad_request_without_retry():
+    client = MagicMock()
+    client.models.count_tokens.side_effect = _FakeAPIError("400 INVALID_ARGUMENT", code=400)
+    with patch("layer_detection.gemini_benchmark.time.sleep") as mock_sleep:
+        with pytest.raises(_FakeAPIError):
+            count_gemini_tokens(client, "gemini-3.1-flash-lite", "prompt")
+    mock_sleep.assert_not_called()
+    assert client.models.count_tokens.call_count == 1
+
+
+def test_count_gemini_tokens_stops_on_daily_quota():
+    client = MagicMock()
+    client.models.count_tokens.side_effect = _FakeAPIError(
+        "429 RESOURCE_EXHAUSTED PerDay quota", code=429
+    )
+    with patch("layer_detection.gemini_benchmark.time.sleep") as mock_sleep:
+        with pytest.raises(SystemExit):
+            count_gemini_tokens(client, "gemini-3.1-flash-lite", "prompt")
+    mock_sleep.assert_not_called()
+    assert client.models.count_tokens.call_count == 1
 
 # --------------------------------------------------------------------------- #
 # 5. Overlap Join and Locate Tests
@@ -196,6 +279,7 @@ def test_overlap_join(tmp_path):
         args = MagicMock()
         args.model = "gemini-3.8-flash"
         args.split = "test"
+        args.source = "units"
         
         cmd_locate(args)
         
@@ -211,6 +295,22 @@ def test_overlap_join(tmp_path):
 # --------------------------------------------------------------------------- #
 # 6. Scorer and 20-span round-trip Tests
 # --------------------------------------------------------------------------- #
+
+def test_normalize_finish_reason_strips_sdk_enum_prefix():
+    assert normalize_finish_reason("FinishReason.STOP") == "STOP"
+    assert normalize_finish_reason("STOP") == "STOP"
+    assert normalize_finish_reason("blocked") == "BLOCKED"
+
+
+def test_is_cached_complete_accepts_sdk_enum_strings():
+    assert is_cached_complete("FinishReason.STOP")
+    assert is_cached_complete("STOP")
+    assert is_cached_complete("FinishReason.MAX_TOKENS")
+    assert is_cached_complete("blocked")
+    assert not is_cached_complete("errored")
+    assert not is_cached_complete("")
+    assert not is_cached_complete(None)
+
 
 def test_evaluate_predictions_round_trip():
     # Verify that evaluating predictions with whitespace trim and stitch ON/OFF is working

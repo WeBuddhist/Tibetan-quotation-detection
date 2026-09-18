@@ -51,6 +51,31 @@ CLAUDE_OUTPUT_PROJECTION_PER_UNIT = 20_000
 def get_sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
+CACHE_COMPLETE_REASONS = {
+    "STOP_REASON_UNSPECIFIED",
+    "STOP",
+    "MAX_TOKENS",
+    "SAFETY",
+    "OTHER",
+    "BLOCKED",
+}
+
+
+def normalize_finish_reason(reason: Any) -> str:
+    """Strip SDK enum prefixes so FinishReason.STOP and STOP compare equal."""
+    if reason is None:
+        return ""
+    name = getattr(reason, "name", None)
+    text = name if isinstance(name, str) and name else str(reason)
+    text = text.strip()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text.upper()
+
+
+def is_cached_complete(finish_reason: Any) -> bool:
+    return normalize_finish_reason(finish_reason) in CACHE_COMPLETE_REASONS
+
 def make_units(text: str, book_id: str, max_chars: int = 250_000, overlap_chars: int = 2_000) -> list[dict]:
     n = len(text)
     if n <= max_chars:
@@ -170,6 +195,82 @@ def get_pacific_date_str() -> str:
     tz = zoneinfo.ZoneInfo("America/Los_Angeles")
     return datetime.now(tz).strftime("%Y-%m-%d")
 
+MAX_SERVER_ATTEMPTS = 5
+COUNT_TOKEN_RETRY_WAIT_SECONDS = 60.0
+
+
+def classify_gemini_run_error(exc: Exception) -> str:
+    """Classify a generate_content failure: daily, rate, bad_request, or server."""
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        code = getattr(exc, "status_code", None)
+    exc_str = str(exc)
+    lowered = exc_str.lower()
+    is_daily = (
+        "perday" in lowered
+        or "daily" in lowered
+        or ("limit" in lowered and "day" in lowered)
+    )
+    is_rate = code == 429 or "429" in exc_str or "quota" in lowered
+    is_bad_request = code == 400 or "invalid_argument" in lowered
+    if is_daily:
+        return "daily"
+    if is_rate:
+        return "rate"
+    if is_bad_request:
+        return "bad_request"
+    return "server"
+
+
+def next_server_wait_seconds(attempts: int, jitter: float | None = None) -> float:
+    extra = random.uniform(1.0, 5.0) if jitter is None else jitter
+    return min(240.0, 30.0 * (2 ** (attempts - 1))) + extra
+
+
+def unit_failure_action(error_kind: str, attempts: int, *, second_pass: bool) -> str:
+    """Decide what cmd_run should do after a failed generate_content call."""
+    if error_kind == "daily":
+        return "stop_daily"
+    if error_kind == "bad_request":
+        return "stop_bad_request"
+    if error_kind == "rate":
+        return "wait_rate"
+    if attempts < MAX_SERVER_ATTEMPTS:
+        return "wait_server"
+    return "give_up" if second_pass else "defer"
+
+
+def count_gemini_tokens(client: Any, model: str, contents: str) -> int:
+    """Call count_tokens, waiting a minute and retrying on timeout or other transient failures."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return int(client.models.count_tokens(model=model, contents=contents).total_tokens)
+        except Exception as exc:
+            kind = classify_gemini_run_error(exc)
+            if kind == "bad_request":
+                raise
+            if kind == "daily":
+                print("  [429 DAILY LIMIT] count_tokens quota exceeded. Stopping process cleanly.")
+                sys.exit(0)
+            wait_sec = COUNT_TOKEN_RETRY_WAIT_SECONDS
+            if kind == "rate":
+                wait_sec += random.uniform(1.0, 5.0)
+            print(f"  [TOKEN COUNT] {exc}. Waiting {wait_sec:.0f}s before retry {attempt}...")
+            time.sleep(wait_sec)
+
+
+def _strip_retry_marker(unit: dict) -> dict:
+    return {k: v for k, v in unit.items() if k != "_retry_pass"}
+
+
+def write_retry_list(path: Path, units: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for unit in units:
+            f.write(json.dumps(_strip_retry_marker(dict(unit)), ensure_ascii=False) + "\n")
+
 # --------------------------------------------------------------------------- #
 # CLI Subcommands: build-units and build-windows
 # --------------------------------------------------------------------------- #
@@ -196,31 +297,41 @@ def cmd_build_units(args):
 def cmd_build_windows(args):
     EXP_DIR.mkdir(parents=True, exist_ok=True)
     
-    books = load_gold_books("validation")
-    windows = []
-    for b in books:
-        book_windows = make_windows(b["text"], b["book_id"], window_chars=16000, overlap_chars=2000)
-        for idx, w in enumerate(book_windows):
-            windows.append({
-                "book_id": w.book_id,
-                "piece": idx,
-                "start": w.start,
-                "end": w.end,
-                "sha1": get_sha1(w.text),
-            })
-            
-    out_path = EXP_DIR / "windows_validation.jsonl"
-    with out_path.open("w", encoding="utf-8") as f:
-        for w in windows:
-            f.write(json.dumps(w, ensure_ascii=False) + "\n")
-    print(f"Successfully wrote {len(windows)} windows to {out_path}")
+    for split in ["test", "validation"]:
+        books = load_gold_books(split)
+        windows = []
+        for b in books:
+            book_windows = make_windows(b["text"], b["book_id"], window_chars=16000, overlap_chars=2000)
+            for idx, w in enumerate(book_windows):
+                windows.append({
+                    "book_id": w.book_id,
+                    "piece": idx,
+                    "start": w.start,
+                    "end": w.end,
+                    "sha1": get_sha1(w.text),
+                })
+                
+        expected_rows = 333 if split == "test" else 334
+        assert len(windows) == expected_rows, f"Expected {expected_rows} windows for {split}, but got {len(windows)}"
+        
+        out_path = EXP_DIR / f"windows_{split}.jsonl"
+        payload_bytes = ("".join(json.dumps(w, ensure_ascii=False) + "\n" for w in windows)).encode("utf-8")
+        if out_path.is_file():
+            existing_bytes = out_path.read_bytes()
+            if existing_bytes == payload_bytes:
+                print(f"File {out_path} already exists and is identical. Skipping write.")
+                continue
+                
+        with out_path.open("wb") as f:
+            f.write(payload_bytes)
+        print(f"Successfully wrote {len(windows)} windows to {out_path}")
 
 # --------------------------------------------------------------------------- #
 # CLI Subcommand: preflight
 # --------------------------------------------------------------------------- #
 
 def cmd_preflight(args):
-    gemini_key, anthropic_key = check_api_keys()
+    gemini_key, anthropic_key = check_api_keys(require_gemini=True, require_anthropic=False)
     limits = load_limits()
     
     prompt_path = ROOT / "docs" / "prompts" / "gemini_quote_only_anchors_v2.md"
@@ -231,24 +342,32 @@ def cmd_preflight(args):
     expected_sha1 = "e88f021573bb97fd3733282caa8b4c966501bf9f"
     assert template_sha1 == expected_sha1, f"Prompt sha1 mismatch: expected {expected_sha1}, got {template_sha1}"
     
-    # Init clients
+    # Init clients. Anthropic is optional — Gemini-only preflight is enough for the Gemini run path.
     from google import genai
-    import anthropic
     gemini_client = genai.Client(api_key=gemini_key)
-    anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
+    anthropic_client = None
+    c_api_model = None
+    if anthropic_key:
+        import anthropic
+        anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
+        c_api_model = resolve_anthropic_model("claude-sonnet-5")
+    else:
+        print("ANTHROPIC_API_KEY not set; skipping Claude token counts and smoke test.")
     
     # Process both test and validation units + validation windows
     splits_to_count = {
         "units_test": EXP_DIR / "units_test.jsonl",
         "units_validation": EXP_DIR / "units_validation.jsonl",
+        "windows_test": EXP_DIR / "windows_test.jsonl",
         "windows_validation": EXP_DIR / "windows_validation.jsonl",
     }
     
     preflight_counts = {
         "gemini-3.8-flash": {},
         "gemini-3.1-flash-lite": {},
-        "claude-sonnet-5": {},
     }
+    if anthropic_client:
+        preflight_counts["claude-sonnet-5"] = {}
     
     # Load all base texts to construct fill
     # We will build a quick lookup dict for base texts
@@ -286,22 +405,23 @@ def cmd_preflight(args):
                 filled = fill_prompt_v2(template, utext)
                 
                 # Count tokens
-                g2_tokens = int(gemini_client.models.count_tokens(model="gemini-3.8-flash", contents=filled).total_tokens)
-                g1_tokens = int(gemini_client.models.count_tokens(model="gemini-3.1-flash-lite", contents=filled).total_tokens)
+                g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
+                g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
                 
-                c_api_model = resolve_anthropic_model("claude-sonnet-5")
-                c_resp = anthropic_client.messages.count_tokens(
-                    model=c_api_model,
-                    messages=[{"role": "user", "content": filled}]
-                )
-                c_tokens = int(c_resp.input_tokens)
+                c_tokens = 0
+                if anthropic_client:
+                    c_resp = anthropic_client.messages.count_tokens(
+                        model=c_api_model,
+                        messages=[{"role": "user", "content": filled}]
+                    )
+                    c_tokens = int(c_resp.input_tokens)
                 
                 # Fit checks: 170K Gemini, 1M - 64K Claude
                 is_g2_heavy = g2_tokens > 170_000
                 is_g1_heavy = g1_tokens > 170_000
-                is_c_heavy = (c_tokens + 64_000) > 1_000_000
+                is_c_heavy = anthropic_client is not None and (c_tokens + 64_000) > 1_000_000
                 
-                if (is_g2_heavy or is_g1_heavy or is_c_heavy) and key != "windows_validation":
+                if (is_g2_heavy or is_g1_heavy or is_c_heavy) and key not in ("windows_validation", "windows_test"):
                     print(f"Preflight cut: Unit {bid} [{start}:{end}] is too large (G2:{g2_tokens}, G1:{g1_tokens}, C:{c_tokens}). Splitting in half...")
                     # Perform half-cut
                     cuts = cut_points(base_texts[bid])
@@ -372,21 +492,21 @@ def cmd_preflight(args):
             utext = base_texts[bid][start:end]
             filled = fill_prompt_v2(template, utext)
             
-            g2_tokens = int(gemini_client.models.count_tokens(model="gemini-3.8-flash", contents=filled).total_tokens)
-            g1_tokens = int(gemini_client.models.count_tokens(model="gemini-3.1-flash-lite", contents=filled).total_tokens)
-            c_resp = anthropic_client.messages.count_tokens(
-                model=c_api_model,
-                messages=[{"role": "user", "content": filled}]
-            )
-            c_tokens = int(c_resp.input_tokens)
-            
+            g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
+            g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
             g2_counts[ukey] = g2_tokens
             g1_counts[ukey] = g1_tokens
-            c_counts[ukey] = c_tokens
+            if anthropic_client:
+                c_resp = anthropic_client.messages.count_tokens(
+                    model=c_api_model,
+                    messages=[{"role": "user", "content": filled}]
+                )
+                c_counts[ukey] = int(c_resp.input_tokens)
             
         preflight_counts["gemini-3.8-flash"][key] = g2_counts
         preflight_counts["gemini-3.1-flash-lite"][key] = g1_counts
-        preflight_counts["claude-sonnet-5"][key] = c_counts
+        if anthropic_client:
+            preflight_counts["claude-sonnet-5"][key] = c_counts
         
     # Write preflight.json
     out_preflight = EXP_DIR / "preflight.json"
@@ -398,9 +518,18 @@ def cmd_preflight(args):
     # Tokens per character
     total_chars = sum(len(base_texts[u["book_id"]][u["start"]:u["end"]]) for split in ["units_test", "units_validation"] for u in json_lines(EXP_DIR / f"{split}.jsonl"))
     
-    total_g2_tokens = sum(preflight_counts["gemini-3.8-flash"][split][ukey] for split in ["units_test", "units_validation"] for ukey in preflight_counts["gemini-3.8-flash"][split])
-    total_g1_tokens = sum(preflight_counts["gemini-3.1-flash-lite"][split][ukey] for split in ["units_test", "units_validation"] for ukey in preflight_counts["gemini-3.1-flash-lite"][split])
-    total_c_tokens = sum(preflight_counts["claude-sonnet-5"][split][ukey] for split in ["units_test", "units_validation"] for ukey in preflight_counts["claude-sonnet-5"][split])
+    def _sum_model_tokens(model_name: str) -> int:
+        model_counts = preflight_counts.get(model_name, {})
+        return sum(
+            model_counts[split][ukey]
+            for split in ["units_test", "units_validation"]
+            if split in model_counts
+            for ukey in model_counts[split]
+        )
+
+    total_g2_tokens = _sum_model_tokens("gemini-3.8-flash")
+    total_g1_tokens = _sum_model_tokens("gemini-3.1-flash-lite")
+    total_c_tokens = _sum_model_tokens("claude-sonnet-5") if anthropic_client else 0
     
     g2_rate = total_g2_tokens / total_chars if total_chars else 0
     g1_rate = total_g1_tokens / total_chars if total_chars else 0
@@ -412,12 +541,13 @@ def cmd_preflight(args):
     print(f"Total processed characters (test + validation units): {total_chars:,}")
     print(f"Gemini 3.8 Flash Rate:     {g2_rate:.4f} tokens/char (Total tokens: {total_g2_tokens:,})")
     print(f"Gemini 3.1 Flash Lite Rate: {g1_rate:.4f} tokens/char (Total tokens: {total_g1_tokens:,})")
-    print(f"Claude Sonnet 5 Rate:      {c_rate:.4f} tokens/char (Total tokens: {total_c_tokens:,})")
+    if anthropic_client:
+        print(f"Claude Sonnet 5 Rate:      {c_rate:.4f} tokens/char (Total tokens: {total_c_tokens:,})")
     print("-"*80)
     
     # Days needed calculations
     # Test set sizes
-    test_units = len(preflight_counts["gemini-3.8-flash"]["units_test"])
+    test_units = len(preflight_counts["gemini-3.8-flash"].get("units_test", {}))
     g2_rpd = limits.get("gemini-3.8-flash", {}).get("rpd", 20)
     g1_rpd = limits.get("gemini-3.1-flash-lite", {}).get("rpd", 500)
     
@@ -429,24 +559,26 @@ def cmd_preflight(args):
     print(f"Gemini 3.1 Flash Lite: RPD limit = {g1_rpd} | Days needed = {g1_days_test:.2f}")
     print("-"*80)
     
-    # Estimated Claude Cost
-    # We estimate based on test split units
-    test_c_input_tokens = sum(preflight_counts["claude-sonnet-5"]["units_test"].values())
-    est_c_input_cost = (test_c_input_tokens * CLAUDE_INPUT_PRICE_PER_M) / 1_000_000
-    est_c_output_tokens = test_units * CLAUDE_OUTPUT_PROJECTION_PER_UNIT
-    est_c_output_cost = (est_c_output_tokens * CLAUDE_OUTPUT_PRICE_PER_M) / 1_000_000
-    est_c_total_cost = est_c_input_cost + est_c_output_cost
-    
-    print(f"Claude Sonnet 5 Estimated Test Cost (using 50% Batch Discount):")
-    print(f"  Input Tokens:  {test_c_input_tokens:,} (Cost: ${est_c_input_cost:.4f})")
-    print(f"  Output Tokens: {est_c_output_tokens:,} projected (Cost: ${est_c_output_cost:.4f})")
-    print(f"  Total Cost:    ${est_c_total_cost:.4f}")
+    if anthropic_client:
+        # Estimated Claude Cost
+        # We estimate based on test split units
+        test_c_input_tokens = sum(preflight_counts["claude-sonnet-5"].get("units_test", {}).values())
+        est_c_input_cost = (test_c_input_tokens * CLAUDE_INPUT_PRICE_PER_M) / 1_000_000
+        est_c_output_tokens = test_units * CLAUDE_OUTPUT_PROJECTION_PER_UNIT
+        est_c_output_cost = (est_c_output_tokens * CLAUDE_OUTPUT_PRICE_PER_M) / 1_000_000
+        est_c_total_cost = est_c_input_cost + est_c_output_cost
+        
+        print(f"Claude Sonnet 5 Estimated Test Cost (using 50% Batch Discount):")
+        print(f"  Input Tokens:  {test_c_input_tokens:,} (Cost: ${est_c_input_cost:.4f})")
+        print(f"  Output Tokens: {est_c_output_tokens:,} projected (Cost: ${est_c_output_cost:.4f})")
+        print(f"  Total Cost:    ${est_c_total_cost:.4f}")
     print("="*80)
     
     # Tiny window configuration check
     print("\nRunning single-shot test call per model on a tiny window to verify credentials and thinking settings...")
     tiny_text = "ལུང་ལས། ཆོས་རྣམས་ཐམས་ཅད་བཀའ་དང་བསཏན་བཅོས་གཉིས་སུ་འདུས། །ཞེས་གསུངས་སོ། །"
     tiny_filled = fill_prompt_v2(template, tiny_text)
+    smoke_total = 3 if anthropic_client else 2
     
     # 1. Gemini 3.8 Flash test
     try:
@@ -477,7 +609,7 @@ def cmd_preflight(args):
             response_schema=schema,
             thinking_config=types.ThinkingConfig(thinking_level="low")
         )
-        print("  [1/3] Calling Gemini 3.8 Flash ... ", end="", flush=True)
+        print(f"  [1/{smoke_total}] Calling Gemini 3.8 Flash ... ", end="", flush=True)
         resp_g2 = gemini_client.models.generate_content(model="gemini-3.8-flash", contents=tiny_filled, config=cfg_g2)
         print("OK! Output parsed successfully.")
     except Exception as e:
@@ -492,49 +624,50 @@ def cmd_preflight(args):
             response_schema=schema,
             thinking_config=types.ThinkingConfig(thinking_level="low")
         )
-        print("  [2/3] Calling Gemini 3.1 Flash Lite ... ", end="", flush=True)
+        print(f"  [2/{smoke_total}] Calling Gemini 3.1 Flash Lite ... ", end="", flush=True)
         resp_g1 = gemini_client.models.generate_content(model="gemini-3.1-flash-lite", contents=tiny_filled, config=cfg_g1)
         print("OK! Output parsed successfully.")
     except Exception as e:
         print(f"FAILED: {e}")
         
-    # 3. Claude Sonnet 5 test
-    try:
-        schema_claude = {
-            "type": "object",
-            "properties": {
-                "spans": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string"},
-                            "frame": {"type": "string"},
-                            "head": {"type": "string"},
-                            "tail": {"type": "string"}
-                        },
-                        "required": ["label", "head", "tail"]
+    # 3. Claude Sonnet 5 test (only when an Anthropic key is present)
+    if anthropic_client:
+        try:
+            schema_claude = {
+                "type": "object",
+                "properties": {
+                    "spans": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "frame": {"type": "string"},
+                                "head": {"type": "string"},
+                                "tail": {"type": "string"}
+                            },
+                            "required": ["label", "head", "tail"]
+                        }
                     }
-                }
-            },
-            "required": ["spans"]
-        }
-        print("  [3/3] Calling Claude Sonnet 5 (Single Message API) ... ", end="", flush=True)
-        resp_c = anthropic_client.messages.create(
-            model=c_api_model,
-            max_tokens=4096,
-            messages=[{"role": "user", "content": tiny_filled}],
-            thinking={"type": "adaptive"},
-            output_config={
-                "effort": "low",
-                "format": {"type": "json_schema", "schema": schema_claude}
+                },
+                "required": ["spans"]
             }
-        )
-        print("OK! Output parsed successfully.")
-    except Exception as e:
-        print(f"FAILED: {e}")
+            print(f"  [3/{smoke_total}] Calling Claude Sonnet 5 (Single Message API) ... ", end="", flush=True)
+            resp_c = anthropic_client.messages.create(
+                model=c_api_model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": tiny_filled}],
+                thinking={"type": "adaptive"},
+                output_config={
+                    "effort": "low",
+                    "format": {"type": "json_schema", "schema": schema_claude}
+                }
+            )
+            print("OK! Output parsed successfully.")
+        except Exception as e:
+            print(f"FAILED: {e}")
         
-    print("\nSet a Claude monthly spending limit in your Console before the first batch run!")
+        print("\nSet a Claude monthly spending limit in your Console before the first batch run!")
     
     # Prompt for yes if interactive
     if sys.stdin.isatty():
@@ -607,6 +740,7 @@ def update_ledger(ledger_path: Path, p_date: str, max_rpd: int):
 def cmd_run(args):
     model = args.model
     split = args.split
+    source = getattr(args, "source", "units")
     
     assert model in ["gemini-3.8-flash", "gemini-3.1-flash-lite"], f"Unknown Gemini model {model}"
     assert split in ["test", "validation"], f"Unknown split {split}"
@@ -623,7 +757,7 @@ def cmd_run(args):
         preflight_data = json.load(f)
         
     # Get units to process
-    units_file = EXP_DIR / f"units_{split}.jsonl"
+    units_file = EXP_DIR / f"{source}_{split}.jsonl"
     if not units_file.is_file():
         raise FileNotFoundError(f"Units file missing: {units_file}")
     units = json_lines(units_file)
@@ -664,7 +798,7 @@ def cmd_run(args):
     
     model_dir = EXP_DIR / model
     model_dir.mkdir(parents=True, exist_ok=True)
-    ledger_path = model_dir / "ledger.json"
+    ledger_path = model_dir / ("ledger_windows.json" if source == "windows" else "ledger.json")
     
     # Setup pacing log
     pacing_log = []
@@ -692,9 +826,13 @@ def cmd_run(args):
     
     print(f"Starting Gemini run for model {model} on split {split} (Total units: {len(units)})")
     
+    cache_sub_dir = "raw" if source == "units" else "raw_windows"
+    
     # We maintain a queue because mid-run split can add units dynamically!
     unit_queue = list(units)
     processed_count = 0
+    still_failed: list[dict] = []
+    retry_list_path = model_dir / f"retry_{split}.jsonl"
     
     while unit_queue:
         u = unit_queue.pop(0)
@@ -704,14 +842,14 @@ def cmd_run(args):
         start = u["start"]
         end = u["end"]
         
-        raw_cache_path = model_dir / "raw" / bid / f"{piece}.json"
+        raw_cache_path = model_dir / cache_sub_dir / bid / f"{piece}.json"
         
         # Verify if exists and valid
         if raw_cache_path.is_file():
             try:
                 with raw_cache_path.open("r", encoding="utf-8") as f:
                     cached = json.load(f)
-                if cached.get("finish_reason") in ["STOP_REASON_UNSPECIFIED", "STOP", "MAX_TOKENS", "SAFETY", "OTHER", "blocked"]:
+                if is_cached_complete(cached.get("finish_reason")):
                     # Skip finished
                     # Assert prompt_sha1 and unit_sha1 match!
                     assert cached.get("prompt_sha1") == template_sha1, f"Prompt sha1 mismatch in cache for {ukey}"
@@ -725,12 +863,12 @@ def cmd_run(args):
                 pass
                 
         # Token count for pacing
-        preflight_key = f"units_{split}"
+        preflight_key = f"{source}_{split}"
         unit_tokens = preflight_data.get(model, {}).get(preflight_key, {}).get(ukey)
         if unit_tokens is None:
             # If not in preflight (due to mid-run splits), we calculate it now
             filled_prompt = fill_prompt_v2(template, base_texts[bid][start:end])
-            unit_tokens = int(gemini_client.models.count_tokens(model=model, contents=filled_prompt).total_tokens)
+            unit_tokens = count_gemini_tokens(gemini_client, model, filled_prompt)
             
         print(f"Processing unit {ukey} [{start}:{end}] with {unit_tokens:,} tokens...")
         
@@ -783,7 +921,7 @@ def cmd_run(args):
                     "window_sha1": u["sha1"],
                     "temperature": 1.0,
                     "thinking": "low",
-                    "finish_reason": "blocked" if is_blocked else ("MAX_TOKENS" if is_truncated else reason),
+                    "finish_reason": "blocked" if is_blocked else ("MAX_TOKENS" if is_truncated else normalize_finish_reason(reason) or reason),
                     "usage": usage,
                     "raw_text": raw_text,
                     "attempts": attempts,
@@ -817,29 +955,54 @@ def cmd_run(args):
                     success = True
                     
             except Exception as exc:
-                exc_str = str(exc)
-                is_daily = "perday" in exc_str.lower() or "daily" in exc_str.lower() or "limit" in exc_str.lower() and "day" in exc_str.lower()
-                is_rate = "429" in exc_str or "quota" in exc_str.lower()
-                
-                if is_daily:
+                kind = classify_gemini_run_error(exc)
+                action = unit_failure_action(
+                    kind, attempts, second_pass=bool(u.get("_retry_pass"))
+                )
+                if action == "stop_daily":
                     print(f"  [429 DAILY LIMIT] Quota exceeded. Stopping process cleanly without writing failed cache.")
                     sys.exit(0)
-                elif is_rate:
-                    # Retry after wait
+                if action == "stop_bad_request":
+                    print(f"  [400 BAD REQUEST] Config bug. Stopping. {exc}")
+                    raise
+                if action == "wait_rate":
                     wait_sec = 60 + random.uniform(1.0, 5.0)
                     print(f"  [429 RATE LIMIT] Waiting {wait_sec:.0f}s before retry {attempts}...")
                     time.sleep(wait_sec)
-                else:
-                    # Server busy/500/503 or timeout
-                    wait_sec = min(240.0, 30.0 * (2 ** (attempts - 1))) + random.uniform(1.0, 5.0)
-                    print(f"  [ERROR] {exc_str}. Waiting {wait_sec:.0f}s before retry {attempts}...")
+                    continue
+                if action == "wait_server":
+                    wait_sec = next_server_wait_seconds(attempts)
+                    print(f"  [ERROR] {exc}. Waiting {wait_sec:.0f}s before retry {attempts}...")
                     time.sleep(wait_sec)
-                    if attempts >= 5:
-                        print(f"  [FAILED] Unit {ukey} failed after 5 attempts. Moving to retry list.")
-                        raise exc
+                    continue
+                if action == "defer":
+                    print(f"  [FAILED] Unit {ukey} failed after 5 attempts. Moving to retry list.")
+                    deferred = dict(u)
+                    deferred["_retry_pass"] = True
+                    unit_queue.append(deferred)
+                    pending = still_failed + [
+                        item for item in unit_queue if item.get("_retry_pass")
+                    ]
+                    write_retry_list(retry_list_path, pending)
+                    break
+                print(f"  [FAILED] Unit {ukey} failed on second pass after 5 attempts. Leaving uncached.")
+                still_failed.append(_strip_retry_marker(u))
+                pending = still_failed + [
+                    item for item in unit_queue if item.get("_retry_pass")
+                ]
+                write_retry_list(retry_list_path, pending)
+                break
                         
         processed_count += 1
-    print(f"Gemini run for {model} completed.")
+    if still_failed:
+        write_retry_list(retry_list_path, still_failed)
+        failed_keys = [f"{item['book_id']}__{item['piece']}" for item in still_failed]
+        print(f"Gemini run for {model} completed with {len(still_failed)} uncached unit(s): {', '.join(failed_keys)}")
+        print(f"  Retry list saved to {retry_list_path}. Re-run the same command to resume.")
+    else:
+        if retry_list_path.is_file():
+            retry_list_path.unlink()
+        print(f"Gemini run for {model} completed.")
 
 def split_unit_in_half(u: dict, book_text: str) -> tuple[dict, dict]:
     bid = u["book_id"]
@@ -1080,12 +1243,13 @@ def cmd_claude_batch(args):
 def cmd_locate(args):
     model = args.model
     split = args.split
+    source = getattr(args, "source", "units")
     
     assert model in ["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"], f"Unknown model {model}"
     assert split in ["test", "validation"], f"Unknown split {split}"
     
     # Load units to process
-    units_file = EXP_DIR / f"units_{split}.jsonl"
+    units_file = EXP_DIR / f"{source}_{split}.jsonl"
     if not units_file.is_file():
         raise FileNotFoundError(f"Units file missing: {units_file}")
     units = json_lines(units_file)
@@ -1097,6 +1261,7 @@ def cmd_locate(args):
         base_texts[b["book_id"]] = b["text"]
         
     model_dir = EXP_DIR / model
+    cache_sub_dir = "raw" if source == "units" else "raw_windows"
     
     # Locate spans per unit/piece
     located_predictions = {} # book_id -> list of predictions
@@ -1108,7 +1273,7 @@ def cmd_locate(args):
         end = u["end"]
         utext = base_texts[bid][start:end]
         
-        raw_cache_path = model_dir / "raw" / bid / f"{piece}.json"
+        raw_cache_path = model_dir / cache_sub_dir / bid / f"{piece}.json"
         if not raw_cache_path.is_file():
             print(f"Missing raw cache for unit {bid}__{piece} at {raw_cache_path}")
             continue
@@ -1127,35 +1292,43 @@ def cmd_locate(args):
         # Since we must find them inside that unit's text, we forward cursor inside the unit
         # Locator is already inclusive. End is start + len(needle) - 1.
         cursor = 0
+        seen = set()
         for q in quotes:
             # We want to search for the quote text inside utext
-            hit = locate_parsed_quote(utext, q, min_score=0.85, from_index=cursor, max_span=2000)
-            if hit is not None:
-                # book offset = unit_start + hit.start
-                b_start = start + hit.start
-                b_end = start + hit.end
-                
-                # Check 20-span round-trip validation
-                # the 20-span text[start:end+1] round-trip
-                chunk_extracted = base_texts[bid][b_start:b_end+1]
-                
-                prediction_item = {
-                    "book_id": bid,
-                    "start": b_start,
-                    "end": b_end,
-                    "piece": piece,
-                    "piece_start": start,
-                    "piece_end": end,
-                    "text": chunk_extracted,
-                    "label": q.label,
-                    "cls": q.label
-                }
-                
-                if bid not in located_predictions:
-                    located_predictions[bid] = []
-                located_predictions[bid].append(prediction_item)
-                
-                cursor = hit.end + 1
+            h = locate_parsed_quote(utext, q, min_score=0.85, from_index=cursor, max_span=2000)
+            if h is None:
+                h = locate_parsed_quote(utext, q, min_score=0.85, from_index=0, max_span=2000)
+            if h is None:
+                continue
+            if (h.start, h.end) in seen:
+                continue
+            seen.add((h.start, h.end))
+            
+            # book offset = unit_start + h.start
+            b_start = start + h.start
+            b_end = start + h.end
+            
+            # Check 20-span round-trip validation
+            # the 20-span text[start:end+1] round-trip
+            chunk_extracted = base_texts[bid][b_start:b_end+1]
+            
+            prediction_item = {
+                "book_id": bid,
+                "start": b_start,
+                "end": b_end,
+                "piece": piece,
+                "piece_start": start,
+                "piece_end": end,
+                "text": chunk_extracted,
+                "label": q.label,
+                "cls": q.label
+            }
+            
+            if bid not in located_predictions:
+                located_predictions[bid] = []
+            located_predictions[bid].append(prediction_item)
+            
+            cursor = max(cursor, h.end + 1)
                 
     # Now we apply three overlap-join rules to merge predictions per book
     final_spans = []
@@ -1181,15 +1354,8 @@ def cmd_locate(args):
             last = merged_preds[-1]
             
             # Check overlap or proximity
-            # (c) Join adjacent pieces: if a span ends exactly at a piece's right boundary and another starts exactly at next piece's start
-            # Let's see: ends within 5 chars of piece_end and starts within 5 chars of piece_start
-            last_ends_near_edge = (last["piece_end"] - last["end"]) <= 20
-            curr_starts_near_edge = (p["start"] - p["piece_start"]) <= 20
-            
-            # Or if they actually touch or overlap (last['end'] >= p['start'] - 1)
-            # Rule (c): ends exactly at a window edge and starts exactly there
-            # Let's say if they are very close and span across pieces
-            if last["end"] >= p["start"] - 15 and (last_ends_near_edge or curr_starts_near_edge):
+            # (c) Join adjacent pieces: join only when the gap between the two spans is 0 to 5 characters inclusive
+            if 0 <= p["start"] - last["end"] - 1 <= 5:
                 # Join them
                 last["end"] = max(last["end"], p["end"])
                 last["text"] = book_text[last["start"]:last["end"]+1]
@@ -1511,11 +1677,13 @@ def main(argv: list[str] | None = None) -> int:
     
     subparsers.add_parser("build-units", help="Build near-equal units for test & validation")
     subparsers.add_parser("build-windows", help="Build 16k/2k windows for validation comparison")
-    subparsers.add_parser("preflight", help="Run token counting, safety checks and verification")
+    preflight_parser = subparsers.add_parser("preflight", help="Run token counting, safety checks and verification")
+    preflight_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     
     run_parser = subparsers.add_parser("run", help="Run Gemini model processing")
     run_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite"], help="Model ID")
     run_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
+    run_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     
     claude_parser = subparsers.add_parser("claude-batch", help="Submit/Poll Claude Message Batches")
     claude_parser.add_argument("--action", required=True, choices=["create", "poll"], help="Action")
@@ -1524,6 +1692,7 @@ def main(argv: list[str] | None = None) -> int:
     locate_parser = subparsers.add_parser("locate", help="Locate predictions inside text")
     locate_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"], help="Model")
     locate_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
+    locate_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     
     score_parser = subparsers.add_parser("score", help="Score located spans vs gold")
     score_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
