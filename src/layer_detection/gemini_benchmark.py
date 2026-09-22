@@ -179,9 +179,29 @@ def check_api_keys(require_gemini=True, require_anthropic=True):
     return gemini_key, anthropic_key
 
 def resolve_anthropic_model(model_name: str) -> str:
-    if model_name == "claude-sonnet-5":
-        return "claude-3-5-sonnet-20241022"
+    # Claude Sonnet 5's API id is the dateless string itself, not the old 3.5 snapshot.
     return model_name
+
+
+def claude_batch_snapshot(batch: Any) -> dict[str, Any]:
+    """Serialize an Anthropic MessageBatch. Status lives on processing_status, not status."""
+    counts = getattr(batch, "request_counts", None)
+    return {
+        "id": batch.id,
+        "status": batch.processing_status,
+        "created_at": str(batch.created_at),
+        "request_counts": {
+            "processing": getattr(counts, "processing", 0),
+            "succeeded": getattr(counts, "succeeded", 0),
+            "errored": getattr(counts, "errored", 0),
+            "canceled": getattr(counts, "canceled", 0),
+            "expired": getattr(counts, "expired", 0),
+        } if counts is not None else {},
+    }
+
+
+def claude_batch_is_ready(batch: Any) -> bool:
+    return batch.processing_status == "ended"
 
 def load_limits() -> dict:
     limits_path = EXP_DIR / "limits.yaml"
@@ -331,7 +351,18 @@ def cmd_build_windows(args):
 # --------------------------------------------------------------------------- #
 
 def cmd_preflight(args):
-    gemini_key, anthropic_key = check_api_keys(require_gemini=True, require_anthropic=False)
+    selected_model = getattr(args, "model", None)
+    source = getattr(args, "source", "units")
+    want_g2 = selected_model in (None, "gemini-3.8-flash")
+    want_g1 = selected_model in (None, "gemini-3.1-flash-lite")
+    want_claude = selected_model in (None, "claude-sonnet-5")
+    want_gemini = want_g2 or want_g1
+    # All-three preflight still treats Claude as optional. A Claude-only
+    # --model run requires the Anthropic key.
+    gemini_key, anthropic_key = check_api_keys(
+        require_gemini=want_gemini,
+        require_anthropic=selected_model == "claude-sonnet-5",
+    )
     limits = load_limits()
     
     prompt_path = ROOT / "docs" / "prompts" / "gemini_quote_only_anchors_v2.md"
@@ -342,30 +373,29 @@ def cmd_preflight(args):
     expected_sha1 = "e88f021573bb97fd3733282caa8b4c966501bf9f"
     assert template_sha1 == expected_sha1, f"Prompt sha1 mismatch: expected {expected_sha1}, got {template_sha1}"
     
-    # Init clients. Anthropic is optional — Gemini-only preflight is enough for the Gemini run path.
-    from google import genai
-    gemini_client = genai.Client(api_key=gemini_key)
+    gemini_client = None
+    if want_gemini:
+        from google import genai
+        gemini_client = genai.Client(api_key=gemini_key)
     anthropic_client = None
     c_api_model = None
-    if anthropic_key:
+    if want_claude and anthropic_key:
         import anthropic
         anthropic_client = anthropic.Anthropic(api_key=anthropic_key)
         c_api_model = resolve_anthropic_model("claude-sonnet-5")
-    else:
+    elif want_claude:
         print("ANTHROPIC_API_KEY not set; skipping Claude token counts and smoke test.")
     
-    # Process both test and validation units + validation windows
     splits_to_count = {
-        "units_test": EXP_DIR / "units_test.jsonl",
-        "units_validation": EXP_DIR / "units_validation.jsonl",
-        "windows_test": EXP_DIR / "windows_test.jsonl",
-        "windows_validation": EXP_DIR / "windows_validation.jsonl",
+        f"{source}_test": EXP_DIR / f"{source}_test.jsonl",
+        f"{source}_validation": EXP_DIR / f"{source}_validation.jsonl",
     }
     
-    preflight_counts = {
-        "gemini-3.8-flash": {},
-        "gemini-3.1-flash-lite": {},
-    }
+    preflight_counts = {}
+    if want_g2:
+        preflight_counts["gemini-3.8-flash"] = {}
+    if want_g1:
+        preflight_counts["gemini-3.1-flash-lite"] = {}
     if anthropic_client:
         preflight_counts["claude-sonnet-5"] = {}
     
@@ -383,7 +413,7 @@ def cmd_preflight(args):
     
     for key, path in splits_to_count.items():
         if not path.is_file():
-            print(f"File {path} does not exist. Run build-units or build-windows first.")
+            print(f"File {path} does not exist. Run build-{source} first.")
             continue
             
         units = []
@@ -404,9 +434,13 @@ def cmd_preflight(args):
                 utext = base_texts[bid][start:end]
                 filled = fill_prompt_v2(template, utext)
                 
-                # Count tokens
-                g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
-                g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
+                # Count tokens only for the selected model(s)
+                g2_tokens = 0
+                g1_tokens = 0
+                if want_g2:
+                    g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
+                if want_g1:
+                    g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
                 
                 c_tokens = 0
                 if anthropic_client:
@@ -417,8 +451,8 @@ def cmd_preflight(args):
                     c_tokens = int(c_resp.input_tokens)
                 
                 # Fit checks: 170K Gemini, 1M - 64K Claude
-                is_g2_heavy = g2_tokens > 170_000
-                is_g1_heavy = g1_tokens > 170_000
+                is_g2_heavy = want_g2 and g2_tokens > 170_000
+                is_g1_heavy = want_g1 and g1_tokens > 170_000
                 is_c_heavy = anthropic_client is not None and (c_tokens + 64_000) > 1_000_000
                 
                 if (is_g2_heavy or is_g1_heavy or is_c_heavy) and key not in ("windows_validation", "windows_test"):
@@ -492,10 +526,10 @@ def cmd_preflight(args):
             utext = base_texts[bid][start:end]
             filled = fill_prompt_v2(template, utext)
             
-            g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
-            g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
-            g2_counts[ukey] = g2_tokens
-            g1_counts[ukey] = g1_tokens
+            if want_g2:
+                g2_counts[ukey] = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
+            if want_g1:
+                g1_counts[ukey] = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
             if anthropic_client:
                 c_resp = anthropic_client.messages.count_tokens(
                     model=c_api_model,
@@ -503,29 +537,39 @@ def cmd_preflight(args):
                 )
                 c_counts[ukey] = int(c_resp.input_tokens)
             
-        preflight_counts["gemini-3.8-flash"][key] = g2_counts
-        preflight_counts["gemini-3.1-flash-lite"][key] = g1_counts
+        if want_g2:
+            preflight_counts["gemini-3.8-flash"][key] = g2_counts
+        if want_g1:
+            preflight_counts["gemini-3.1-flash-lite"][key] = g1_counts
         if anthropic_client:
             preflight_counts["claude-sonnet-5"][key] = c_counts
         
-    # Write preflight.json
+    # Merge into preflight.json so a single-model run does not wipe other arms
     out_preflight = EXP_DIR / "preflight.json"
+    existing = {}
+    if out_preflight.is_file():
+        with out_preflight.open("r", encoding="utf-8") as f:
+            existing = json.load(f) or {}
+    for model_name, counts in preflight_counts.items():
+        merged = dict(existing.get(model_name, {}))
+        merged.update(counts)
+        existing[model_name] = merged
     with out_preflight.open("w", encoding="utf-8") as f:
-        json.dump(preflight_counts, f, indent=2)
+        json.dump(existing, f, indent=2)
     print(f"Preflight token counting completed. Saved to {out_preflight}")
-    
-    # Calculate metrics
-    # Tokens per character
-    total_chars = sum(len(base_texts[u["book_id"]][u["start"]:u["end"]]) for split in ["units_test", "units_validation"] for u in json_lines(EXP_DIR / f"{split}.jsonl"))
     
     def _sum_model_tokens(model_name: str) -> int:
         model_counts = preflight_counts.get(model_name, {})
         return sum(
-            model_counts[split][ukey]
-            for split in ["units_test", "units_validation"]
-            if split in model_counts
-            for ukey in model_counts[split]
+            tokens
+            for split_counts in model_counts.values()
+            for tokens in split_counts.values()
         )
+
+    total_chars = 0
+    for path in splits_to_count.values():
+        for u in json_lines(path):
+            total_chars += len(base_texts[u["book_id"]][u["start"]:u["end"]])
 
     total_g2_tokens = _sum_model_tokens("gemini-3.8-flash")
     total_g1_tokens = _sum_model_tokens("gemini-3.1-flash-lite")
@@ -538,31 +582,35 @@ def cmd_preflight(args):
     print("\n" + "="*80)
     print(" PREFLIGHT METRICS SUMMARY")
     print("="*80)
-    print(f"Total processed characters (test + validation units): {total_chars:,}")
-    print(f"Gemini 3.8 Flash Rate:     {g2_rate:.4f} tokens/char (Total tokens: {total_g2_tokens:,})")
-    print(f"Gemini 3.1 Flash Lite Rate: {g1_rate:.4f} tokens/char (Total tokens: {total_g1_tokens:,})")
+    print(f"Source: {source}" + (f" | model: {selected_model}" if selected_model else " | model: all"))
+    print(f"Total processed characters (test + validation {source}): {total_chars:,}")
+    if want_g2:
+        print(f"Gemini 3.8 Flash Rate:     {g2_rate:.4f} tokens/char (Total tokens: {total_g2_tokens:,})")
+    if want_g1:
+        print(f"Gemini 3.1 Flash Lite Rate: {g1_rate:.4f} tokens/char (Total tokens: {total_g1_tokens:,})")
     if anthropic_client:
         print(f"Claude Sonnet 5 Rate:      {c_rate:.4f} tokens/char (Total tokens: {total_c_tokens:,})")
     print("-"*80)
     
-    # Days needed calculations
-    # Test set sizes
-    test_units = len(preflight_counts["gemini-3.8-flash"].get("units_test", {}))
-    g2_rpd = limits.get("gemini-3.8-flash", {}).get("rpd", 20)
-    g1_rpd = limits.get("gemini-3.1-flash-lite", {}).get("rpd", 500)
-    
-    g2_days_test = test_units / (0.8 * g2_rpd) if g2_rpd else 0
-    g1_days_test = test_units / (0.8 * g1_rpd) if g1_rpd else 0
-    
-    print(f"Test split units: {test_units}")
-    print(f"Gemini 3.8 Flash:     RPD limit = {g2_rpd} | Days needed = {g2_days_test:.2f}")
-    print(f"Gemini 3.1 Flash Lite: RPD limit = {g1_rpd} | Days needed = {g1_days_test:.2f}")
+    test_key = f"{source}_test"
+    test_units = 0
+    for model_name in preflight_counts:
+        test_units = len(preflight_counts[model_name].get(test_key, {}))
+        if test_units:
+            break
+    print(f"Test split {source}: {test_units}")
+    if want_g2:
+        g2_rpd = limits.get("gemini-3.8-flash", {}).get("rpd", 20)
+        g2_days_test = test_units / (0.8 * g2_rpd) if g2_rpd else 0
+        print(f"Gemini 3.8 Flash:     RPD limit = {g2_rpd} | Days needed = {g2_days_test:.2f}")
+    if want_g1:
+        g1_rpd = limits.get("gemini-3.1-flash-lite", {}).get("rpd", 500)
+        g1_days_test = test_units / (0.8 * g1_rpd) if g1_rpd else 0
+        print(f"Gemini 3.1 Flash Lite: RPD limit = {g1_rpd} | Days needed = {g1_days_test:.2f}")
     print("-"*80)
     
     if anthropic_client:
-        # Estimated Claude Cost
-        # We estimate based on test split units
-        test_c_input_tokens = sum(preflight_counts["claude-sonnet-5"].get("units_test", {}).values())
+        test_c_input_tokens = sum(preflight_counts["claude-sonnet-5"].get(test_key, {}).values())
         est_c_input_cost = (test_c_input_tokens * CLAUDE_INPUT_PRICE_PER_M) / 1_000_000
         est_c_output_tokens = test_units * CLAUDE_OUTPUT_PROJECTION_PER_UNIT
         est_c_output_cost = (est_c_output_tokens * CLAUDE_OUTPUT_PRICE_PER_M) / 1_000_000
@@ -574,14 +622,13 @@ def cmd_preflight(args):
         print(f"  Total Cost:    ${est_c_total_cost:.4f}")
     print("="*80)
     
-    # Tiny window configuration check
-    print("\nRunning single-shot test call per model on a tiny window to verify credentials and thinking settings...")
+    print("\nRunning single-shot test call per selected model on a tiny window to verify credentials and thinking settings...")
     tiny_text = "ལུང་ལས། ཆོས་རྣམས་ཐམས་ཅད་བཀའ་དང་བསཏན་བཅོས་གཉིས་སུ་འདུས། །ཞེས་གསུངས་སོ། །"
     tiny_filled = fill_prompt_v2(template, tiny_text)
-    smoke_total = 3 if anthropic_client else 2
-    
-    # 1. Gemini 3.8 Flash test
-    try:
+    smoke_total = int(want_g2) + int(want_g1) + int(bool(anthropic_client))
+    smoke_i = 0
+
+    if want_gemini:
         from google.genai import types
         schema = {
             "type": "OBJECT",
@@ -602,44 +649,51 @@ def cmd_preflight(args):
             },
             "required": ["spans"]
         }
-        cfg_g2 = types.GenerateContentConfig(
-            max_output_tokens=4096,
-            temperature=1.0,
-            response_mime_type="application/json",
-            response_schema=schema,
-            thinking_config=types.ThinkingConfig(thinking_level="low")
-        )
-        print(f"  [1/{smoke_total}] Calling Gemini 3.8 Flash ... ", end="", flush=True)
-        resp_g2 = gemini_client.models.generate_content(model="gemini-3.8-flash", contents=tiny_filled, config=cfg_g2)
-        print("OK! Output parsed successfully.")
-    except Exception as e:
-        print(f"FAILED: {e}")
-        
-    # 2. Gemini 3.1 Flash Lite test
-    try:
-        cfg_g1 = types.GenerateContentConfig(
-            max_output_tokens=4096,
-            temperature=1.0,
-            response_mime_type="application/json",
-            response_schema=schema,
-            thinking_config=types.ThinkingConfig(thinking_level="low")
-        )
-        print(f"  [2/{smoke_total}] Calling Gemini 3.1 Flash Lite ... ", end="", flush=True)
-        resp_g1 = gemini_client.models.generate_content(model="gemini-3.1-flash-lite", contents=tiny_filled, config=cfg_g1)
-        print("OK! Output parsed successfully.")
-    except Exception as e:
-        print(f"FAILED: {e}")
-        
-    # 3. Claude Sonnet 5 test (only when an Anthropic key is present)
+
+    if want_g2:
+        smoke_i += 1
+        try:
+            cfg_g2 = types.GenerateContentConfig(
+                max_output_tokens=4096,
+                temperature=1.0,
+                response_mime_type="application/json",
+                response_schema=schema,
+                thinking_config=types.ThinkingConfig(thinking_level="low")
+            )
+            print(f"  [{smoke_i}/{smoke_total}] Calling Gemini 3.8 Flash ... ", end="", flush=True)
+            gemini_client.models.generate_content(model="gemini-3.8-flash", contents=tiny_filled, config=cfg_g2)
+            print("OK! Output parsed successfully.")
+        except Exception as e:
+            print(f"FAILED: {e}")
+
+    if want_g1:
+        smoke_i += 1
+        try:
+            cfg_g1 = types.GenerateContentConfig(
+                max_output_tokens=4096,
+                temperature=1.0,
+                response_mime_type="application/json",
+                response_schema=schema,
+                thinking_config=types.ThinkingConfig(thinking_level="low")
+            )
+            print(f"  [{smoke_i}/{smoke_total}] Calling Gemini 3.1 Flash Lite ... ", end="", flush=True)
+            gemini_client.models.generate_content(model="gemini-3.1-flash-lite", contents=tiny_filled, config=cfg_g1)
+            print("OK! Output parsed successfully.")
+        except Exception as e:
+            print(f"FAILED: {e}")
+
     if anthropic_client:
+        smoke_i += 1
         try:
             schema_claude = {
                 "type": "object",
+                "additionalProperties": False,
                 "properties": {
                     "spans": {
                         "type": "array",
                         "items": {
                             "type": "object",
+                            "additionalProperties": False,
                             "properties": {
                                 "label": {"type": "string"},
                                 "frame": {"type": "string"},
@@ -652,8 +706,8 @@ def cmd_preflight(args):
                 },
                 "required": ["spans"]
             }
-            print(f"  [3/{smoke_total}] Calling Claude Sonnet 5 (Single Message API) ... ", end="", flush=True)
-            resp_c = anthropic_client.messages.create(
+            print(f"  [{smoke_i}/{smoke_total}] Calling Claude Sonnet 5 (Single Message API) ... ", end="", flush=True)
+            anthropic_client.messages.create(
                 model=c_api_model,
                 max_tokens=4096,
                 messages=[{"role": "user", "content": tiny_filled}],
@@ -1055,7 +1109,7 @@ def cmd_claude_batch(args):
     action = args.action
     split = args.split
     
-    assert action in ["create", "poll"], f"Unknown action {action}"
+    assert action in ["create", "poll", "list", "attach"], f"Unknown action {action}"
     assert split in ["test", "validation"], f"Unknown split {split}"
     
     _, anthropic_key = check_api_keys(require_gemini=False, require_anthropic=True)
@@ -1073,11 +1127,13 @@ def cmd_claude_batch(args):
     
     schema_claude = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "spans": {
                 "type": "array",
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
                         "label": {"type": "string"},
                         "frame": {"type": "string"},
@@ -1127,26 +1183,70 @@ def cmd_claude_batch(args):
                 }
             })
             
+        if batch_json_path.is_file():
+            existing = json.loads(batch_json_path.read_text(encoding="utf-8"))
+            raise SystemExit(
+                f"{batch_json_path.name} already exists ({existing.get('id')}). "
+                "Poll that batch, or use --action attach --batch-id <id> to recover. "
+                "Do not create a second batch for the same split."
+            )
+
         print(f"Creating Claude batch for split {split} (Requests count: {len(requests)})...")
         # Submit the batch
         batch = client.messages.batches.create(requests=requests)
-        
-        # Write batch.json immediately so a crash can reconnect
-        batch_info = {
-            "id": batch.id,
-            "status": batch.status,
-            "split": split,
-            "created_at": str(batch.created_at),
-            "units": [u["custom_id"] for u in requests]
-        }
+        unit_ids = [u["custom_id"] for u in requests]
+
+        # Persist the id first so a later field mismatch cannot orphan the batch.
+        batch_info = {"id": batch.id, "split": split, "units": unit_ids}
+        with batch_json_path.open("w", encoding="utf-8") as f:
+            json.dump(batch_info, f, indent=2)
+
+        batch_info.update(claude_batch_snapshot(batch))
+        batch_info["split"] = split
+        batch_info["units"] = unit_ids
         with batch_json_path.open("w", encoding="utf-8") as f:
             json.dump(batch_info, f, indent=2)
             
         print(f"Successfully created batch {batch.id}. Saved info to {batch_json_path}")
+
+    elif action == "list":
+        print("Recent Claude message batches:")
+        page = client.messages.batches.list(limit=20)
+        found = False
+        for b in page:
+            found = True
+            snap = claude_batch_snapshot(b)
+            counts = snap["request_counts"]
+            print(
+                f"  {snap['id']}  status={snap['status']}  created={snap['created_at']}  "
+                f"processing={counts.get('processing', 0)} succeeded={counts.get('succeeded', 0)} "
+                f"errored={counts.get('errored', 0)}"
+            )
+        if not found:
+            print("  (none)")
+
+    elif action == "attach":
+        batch_id = getattr(args, "batch_id", None)
+        if not batch_id:
+            raise SystemExit("--batch-id is required for attach")
+        print(f"Attaching Claude batch {batch_id} to {batch_json_path}...")
+        batch = client.messages.batches.retrieve(batch_id)
+        batch_info = claude_batch_snapshot(batch)
+        batch_info["split"] = split
+        if batch_json_path.is_file():
+            existing = json.loads(batch_json_path.read_text(encoding="utf-8"))
+            batch_info["units"] = existing.get("units", [])
+        else:
+            batch_info["units"] = []
+        with batch_json_path.open("w", encoding="utf-8") as f:
+            json.dump(batch_info, f, indent=2)
+        print(f"Saved {batch_id} (status={batch_info['status']}) to {batch_json_path}")
         
     elif action == "poll":
         if not batch_json_path.is_file():
-            raise FileNotFoundError(f"batch_{split}.json is missing! Run create action first.")
+            raise FileNotFoundError(
+                f"batch_{split}.json is missing! Run create, or list then attach an existing batch."
+            )
             
         with batch_json_path.open("r", encoding="utf-8") as f:
             batch_info = json.load(f)
@@ -1154,14 +1254,15 @@ def cmd_claude_batch(args):
         batch_id = batch_info["id"]
         print(f"Retrieving status for Claude batch {batch_id}...")
         batch = client.messages.batches.retrieve(batch_id)
-        print(f"Batch status: {batch.status}")
+        snap = claude_batch_snapshot(batch)
+        print(f"Batch status: {snap['status']}  request_counts={snap['request_counts']}")
         
         # Update batch status in json
-        batch_info["status"] = batch.status
+        batch_info.update(snap)
         with batch_json_path.open("w", encoding="utf-8") as f:
             json.dump(batch_info, f, indent=2)
             
-        if batch.status == "completed":
+        if claude_batch_is_ready(batch):
             print("Batch completed! Downloading results...")
             raw_dir = model_dir / "raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1679,6 +1780,12 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("build-windows", help="Build 16k/2k windows for validation comparison")
     preflight_parser = subparsers.add_parser("preflight", help="Run token counting, safety checks and verification")
     preflight_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
+    preflight_parser.add_argument(
+        "--model",
+        choices=["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"],
+        default=None,
+        help="Token-count and smoke-test only this model (default: all three)",
+    )
     
     run_parser = subparsers.add_parser("run", help="Run Gemini model processing")
     run_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite"], help="Model ID")
@@ -1686,8 +1793,14 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     
     claude_parser = subparsers.add_parser("claude-batch", help="Submit/Poll Claude Message Batches")
-    claude_parser.add_argument("--action", required=True, choices=["create", "poll"], help="Action")
+    claude_parser.add_argument(
+        "--action",
+        required=True,
+        choices=["create", "poll", "list", "attach"],
+        help="Action",
+    )
     claude_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
+    claude_parser.add_argument("--batch-id", default=None, help="Existing MessageBatch id for attach")
     
     locate_parser = subparsers.add_parser("locate", help="Locate predictions inside text")
     locate_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"], help="Model")

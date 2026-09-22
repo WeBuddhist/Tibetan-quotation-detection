@@ -4,6 +4,8 @@ import time
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 
+from types import SimpleNamespace
+
 from layer_detection.gemini_benchmark import (
     make_units,
     fill_prompt_v2,
@@ -20,6 +22,8 @@ from layer_detection.gemini_benchmark import (
     COUNT_TOKEN_RETRY_WAIT_SECONDS,
     is_cached_complete,
     normalize_finish_reason,
+    claude_batch_snapshot,
+    claude_batch_is_ready,
 )
 
 # --------------------------------------------------------------------------- #
@@ -328,3 +332,24 @@ def test_evaluate_predictions_round_trip():
     
     score_stitch_on = evaluate_predictions(preds, [gold_book], base_texts, stitch=True)
     assert score_stitch_on["f1"] == 1.0  # it trims first, so they match perfectly!
+
+
+def test_claude_batch_snapshot_uses_processing_status():
+    batch = SimpleNamespace(
+        id="msgbatch_1",
+        processing_status="in_progress",
+        created_at="2026-09-21",
+        request_counts=SimpleNamespace(
+            processing=29, succeeded=0, errored=0, canceled=0, expired=0
+        ),
+    )
+    snap = claude_batch_snapshot(batch)
+    assert snap["id"] == "msgbatch_1"
+    assert snap["status"] == "in_progress"
+    assert snap["request_counts"]["processing"] == 29
+
+
+def test_claude_batch_is_ready_when_ended():
+    assert claude_batch_is_ready(SimpleNamespace(processing_status="ended"))
+    assert not claude_batch_is_ready(SimpleNamespace(processing_status="in_progress"))
+    assert not claude_batch_is_ready(SimpleNamespace(processing_status="completed"))

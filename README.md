@@ -12,6 +12,9 @@ quotes another. Two approaches live here side by side:
 Both are scored the same way, so the two can be compared directly. External
 scoring also runs against the DharmaBench QUDT benchmark.
 
+Write-ups with numbers: [docs/encoder-model.md](docs/encoder-model.md) and
+[docs/zero-shot.md](docs/zero-shot.md).
+
 Split out of the older `layer_detection_model_train` repo, which keeps the
 seven-layer work (sabche, tsawa, yigchung, chapter, author, book title).
 
@@ -43,38 +46,122 @@ export ANTHROPIC_API_KEY=...
 | `script/analysis/` | `qd_*.py` — exploratory analysis of quotation markers and per-book statistics |
 | `experiments/` | One folder per run: config, train script, results |
 | `tests/` | pytest suite for the library |
-| `docs/` | Handoffs, prompt versions, evaluation reports |
+| `docs/` | How-to and results: encoder, zero-shot, plus handoffs and prompts |
 | `outputs/` | Saved eval predictions and metrics |
 | `Data/` | Corpus and caches — **not in git** (see below) |
 
-## Pipeline
+## Train the encoder
+
+Full recipe, knobs, and numbers: [docs/encoder-model.md](docs/encoder-model.md).
+
+You do **not** need to rebuild windows if you are training on the published
+set (`karma689/tibetan-quotation-detection`, config
+`windowed_w8192_s4579_bioe`, revision `w2.0`). `train.py` loads that pin and
+refuses an unpinned revision.
 
 ```bash
-# 1. Fetch the annotated corpus (OpenPecha repos listed in Data/tsadra_repo_list.txt)
-python script/download_data.py
-
-# 2. Build the quotation-only window dataset
-python script/build_quotation_windows.py --config script/quotation_w8192_s4751.yaml
-
-# 3. Relabel those windows BIOE (B/I/O/E instead of plain BIO)
-python script/relabel_quotation_bioe.py
-
-# 4. Train
-cd experiments/mmbert_quotation_v3 && python train.py
-
-# 5. Score
-python script/eval_quotation_v3.py
-python script/eval_dharmabench_qudt.py       # external benchmark
-python script/run_gemini_benchmark.py        # Gemini + Claude comparison
+cd experiments/mmbert_quotation_v3
+python train.py --prepare-only    # data + schedule + weight checks, no GPU
+python train.py --smoke           # 200 steps + one eval
+python train.py                   # the run (writes outputs/, scores test)
 ```
+
+GPU: a 24 GB card is enough (bf16 + Flash Attention 2; SDPA if flash-attn is
+missing). On a Vast.ai box: `bash script/setup_vast_train_env.sh`.
+
+Rebuild the windowed set only when the book-level source or the geometry
+changes:
+
+```bash
+python script/download_data.py
+python script/build_quotation_windows.py --config script/quotation_w8192_s4751.yaml
+python script/relabel_quotation_bioe.py --push
+```
+
+## Encoder inference
+
+Scoring a checkpoint *is* the inference path. Choose the Viterbi decode on
+validation, then freeze it before looking at test.
+
+```bash
+# validation
+python script/eval_quotation_v3.py \
+    --config experiments/mmbert_quotation_v3/config.yaml \
+    --checkpoint experiments/mmbert_quotation_v3/outputs/final \
+    --split validation
+
+# held-out test — decode tuned on validation, applied unchanged
+python script/eval_quotation_v3.py \
+    --config experiments/mmbert_quotation_v3/config.yaml \
+    --checkpoint experiments/mmbert_quotation_v3/outputs/final \
+    --split test --tune-on validation
+```
+
+`--checkpoint` can be `outputs/final`, a `checkpoint-*` folder, or the Hub id
+`karma689/tibetan-quotation-detection`.
+
+External benchmark (DharmaBench QUDT — 406 short documents, no windowing):
+
+```bash
+python script/eval_dharmabench_qudt.py \
+    --config experiments/mmbert_quotation_v3/config.yaml \
+    --checkpoint experiments/mmbert_quotation_v3/outputs/checkpoint-6562
+```
+
+Headline in-house result (19 test books, Viterbi, IoU@0.5): **F1 0.853**
+(P 0.831, R 0.876). That number is per-window and in tokens — not the same
+basis as the zero-shot table below. Details in
+[docs/encoder-model.md](docs/encoder-model.md).
+
+## Run zero-shot (Gemini / Claude)
+
+Full method, limits, and numbers: [docs/zero-shot.md](docs/zero-shot.md).
+Needs `GEMINI_API_KEY` and, for Claude, `ANTHROPIC_API_KEY`. Copy live rate
+limits into `experiments/gemini_anchor_v2_test/limits.yaml` before a scored
+run.
+
+**One book** (debug / prompt work; not the quoted benchmark):
+
+```bash
+python script/gemini_extract.py --book P000152 \
+    --prompt docs/prompts/gemini_quote_only_anchors_v2.md \
+    --chunked --out quotes.json
+python script/check_gemini_quotes.py --book P000152 --quotes quotes.json
+```
+
+**Three-model benchmark** on the 19 test books (same gold as the encoder,
+character-level IoU@0.5):
+
+```bash
+python script/run_gemini_benchmark.py build-units
+python script/run_gemini_benchmark.py preflight --source units
+python script/run_gemini_benchmark.py freeze
+
+python script/run_gemini_benchmark.py run --model gemini-3.8-flash --split test --source units
+python script/run_gemini_benchmark.py run --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py claude-batch --action create --split test
+python script/run_gemini_benchmark.py claude-batch --action poll --split test
+
+python script/run_gemini_benchmark.py locate --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py locate --model claude-sonnet-5 --split test --source units
+python script/run_gemini_benchmark.py score --split test
+```
+
+`--split` is `test` or `validation`. `--source` is `units` (default, ~26
+requests) or `windows` (16k chars, 333 requests). Writes
+`experiments/gemini_anchor_v2_test/results.md`.
+
+Latest scored test numbers (stitch on): gemini-3.1-flash-lite **F1 0.696**
+(P 0.595, R 0.838); claude-sonnet-5 F1 0.454 (P 0.714, R 0.333).
+gemini-3.8-flash is not scored yet.
 
 ## Data
 
 `Data/` is gitignored — it holds a gigabyte-scale corpus and several gigabytes of
-tokenized window caches, all regenerable. The canonical copy of the cleaned
-dataset lives on the Hugging Face Hub (`karma689/layer_detection`); pin a
-revision when loading it so a rerun months later can't silently pick up
-different data.
+tokenized window caches, all regenerable. The quotation window set used for
+v3 training is `karma689/tibetan-quotation-detection` @ `w2.0`. The older
+seven-layer book export is `karma689/layer_detection`. Pin a revision when
+loading either so a rerun months later cannot silently pick up different data.
 
 `Data/repos` is a symlink to the corpus checkout in the old repo. To make this
 repo fully standalone, replace the symlink with a real copy or re-run
