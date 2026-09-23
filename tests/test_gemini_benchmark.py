@@ -14,6 +14,7 @@ from layer_detection.gemini_benchmark import (
     get_sha1,
     cmd_locate,
     evaluate_predictions,
+    expand_split_units,
     classify_gemini_run_error,
     next_server_wait_seconds,
     unit_failure_action,
@@ -24,6 +25,7 @@ from layer_detection.gemini_benchmark import (
     normalize_finish_reason,
     claude_batch_snapshot,
     claude_batch_is_ready,
+    split_unit_in_half,
 )
 
 # --------------------------------------------------------------------------- #
@@ -295,6 +297,138 @@ def test_overlap_join(tmp_path):
             lines = [json.loads(line) for line in f]
         assert len(lines) == 1
         assert lines[0]["book_id"] == "book1"
+
+
+def _write_locate_fixture(tmp_path, book_text, raw_by_piece, *, source="units"):
+    exp_dir = tmp_path / "experiments" / "gemini_anchor_v2_test"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    split_file = tmp_path / "Data" / "audit" / "quotation_split.json"
+    split_file.parent.mkdir(parents=True, exist_ok=True)
+    split_file.write_text(json.dumps({"book1": "test"}), encoding="utf-8")
+
+    export_file = tmp_path / "Data" / "hf_export" / "test.jsonl"
+    export_file.parent.mkdir(parents=True, exist_ok=True)
+    export_file.write_text(
+        json.dumps({
+            "book_id": "book1",
+            "text": book_text,
+            "spans": [{"start": 10, "end": 40, "cls": "TEXT"}],
+        })
+        + "\n",
+        encoding="utf-8",
+    )
+
+    repo_file = tmp_path / "Data" / "repos" / "book1" / "book1.opf" / "base" / "v001.txt"
+    repo_file.parent.mkdir(parents=True, exist_ok=True)
+    repo_file.write_text(book_text, encoding="utf-8")
+
+    units_file = exp_dir / f"{source}_test.jsonl"
+    with units_file.open("w") as f:
+        json.dump({
+            "book_id": "book1",
+            "piece": 0,
+            "start": 0,
+            "end": len(book_text),
+            "sha1": get_sha1(book_text),
+        }, f)
+        f.write("\n")
+
+    cache_sub = "raw" if source == "units" else "raw_windows"
+    for piece, raw in raw_by_piece.items():
+        raw_cache_file = exp_dir / "gemini-3.5-flash-lite" / cache_sub / "book1" / f"{piece}.json"
+        raw_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        raw_cache_file.write_text(
+            json.dumps({"finish_reason": raw.get("finish_reason", "STOP"), "raw_text": raw["raw_text"]}),
+            encoding="utf-8",
+        )
+    return exp_dir
+
+
+def test_cmd_locate_salvages_truncated_json(tmp_path):
+    book_text = "AAAA STARTQUOTE body body ENDQUOTE BBBB " * 20
+    truncated = (
+        '{\n  "spans": [\n'
+        '    {\n      "label": "QUOTE",\n'
+        '      "head": "STARTQUOTE",\n'
+        '      "tail": "ENDQUOTE"\n'
+        '    },\n'
+        '    {\n      "label": "QUOTE",\n'
+        '      "head": "UNFINISHED'
+    )
+    exp_dir = _write_locate_fixture(
+        tmp_path,
+        book_text,
+        {"0": {"finish_reason": "MAX_TOKENS", "raw_text": truncated}},
+    )
+
+    with patch("layer_detection.gemini_benchmark.EXP_DIR", exp_dir), \
+         patch("layer_detection.gemini_benchmark.ROOT", tmp_path):
+        args = MagicMock()
+        args.model = "gemini-3.5-flash-lite"
+        args.split = "test"
+        args.source = "units"
+        cmd_locate(args)
+
+    spans_file = exp_dir / "gemini-3.5-flash-lite" / "spans.jsonl"
+    assert spans_file.is_file()
+    lines = [json.loads(line) for line in spans_file.read_text().splitlines() if line]
+    assert len(lines) == 1
+    assert lines[0]["book_id"] == "book1"
+
+
+def test_expand_split_units_replaces_parent_when_children_exist(tmp_path):
+    block = "Tibetan text shad ། " + ("a" * 80) + " ། "
+    text = block * 80
+    unit = {
+        "book_id": "book1",
+        "piece": 6,
+        "start": 0,
+        "end": len(text),
+        "sha1": get_sha1(text),
+    }
+    cache_dir = tmp_path / "book1"
+    cache_dir.mkdir()
+    (cache_dir / "6_0.json").write_text("{}", encoding="utf-8")
+    (cache_dir / "6_1.json").write_text("{}", encoding="utf-8")
+
+    assert expand_split_units(unit, tmp_path / "missing", text) == [unit]
+    expanded = expand_split_units(unit, cache_dir, text)
+    assert [item["piece"] for item in expanded] == ["6_0", "6_1"]
+    half1, half2 = split_unit_in_half(unit, text)
+    assert expanded[0]["start"] == half1["start"]
+    assert expanded[1]["end"] == half2["end"]
+
+
+def test_cmd_locate_uses_split_children_instead_of_truncated_parent(tmp_path):
+    book_text = ("STARTQUOTE middle ENDQUOTE ། " + ("z" * 80)) * 80
+    broken_parent = '{"spans":[{"label":"QUOTE","head":"UNFINISHED'
+    child_json = json.dumps({
+        "spans": [{"label": "QUOTE", "head": "STARTQUOTE", "tail": "ENDQUOTE"}]
+    })
+    exp_dir = _write_locate_fixture(
+        tmp_path,
+        book_text,
+        {
+            "0": {"finish_reason": "MAX_TOKENS", "raw_text": broken_parent},
+            "0_0": {"finish_reason": "STOP", "raw_text": child_json},
+            "0_1": {"finish_reason": "STOP", "raw_text": child_json},
+        },
+    )
+
+    with patch("layer_detection.gemini_benchmark.EXP_DIR", exp_dir), \
+         patch("layer_detection.gemini_benchmark.ROOT", tmp_path):
+        args = MagicMock()
+        args.model = "gemini-3.5-flash-lite"
+        args.split = "test"
+        args.source = "units"
+        cmd_locate(args)
+
+    spans_file = exp_dir / "gemini-3.5-flash-lite" / "spans.jsonl"
+    lines = [json.loads(line) for line in spans_file.read_text().splitlines() if line]
+    assert len(lines) >= 1
+    assert lines[0]["book_id"] == "book1"
+
 
 # --------------------------------------------------------------------------- #
 # 6. Scorer and 20-span round-trip Tests

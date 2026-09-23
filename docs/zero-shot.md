@@ -44,6 +44,7 @@ before a run. The values below were current on 2026-09-11.
 |---|---|---|---|
 | G1 | `gemini-3.8-flash` | Gemini API, one request at a time | 5 RPM · 250K tokens/min · 20 req/day |
 | G2 | `gemini-3.1-flash-lite` | Gemini API, one request at a time | 15 RPM · 250K tokens/min · 500 req/day |
+| G3 | `gemini-3.5-flash-lite` | Gemini API, one request at a time | 15 RPM · 250K tokens/min · 500 req/day |
 | C | `claude-sonnet-5` | Anthropic Message Batches API | 1M-token context · 128K max output |
 
 Shared settings (where the model allows it): temperature 1.0 (Gemini 3
@@ -132,6 +133,7 @@ python script/run_gemini_benchmark.py freeze
 # 4a. Gemini — one process per model; they share no quota
 python script/run_gemini_benchmark.py run --model gemini-3.8-flash --split test --source units
 python script/run_gemini_benchmark.py run --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py run --model gemini-3.5-flash-lite --split test --source units
 
 # 4b. Claude — Message Batches API
 python script/run_gemini_benchmark.py claude-batch --action create --split test
@@ -141,6 +143,7 @@ python script/run_gemini_benchmark.py claude-batch --action attach --split test 
 
 # 5. Map anchors back to offsets
 python script/run_gemini_benchmark.py locate --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py locate --model gemini-3.5-flash-lite --split test --source units
 python script/run_gemini_benchmark.py locate --model claude-sonnet-5 --split test --source units
 python script/run_gemini_benchmark.py locate --model gemini-3.8-flash --split test --source units
 
@@ -162,26 +165,52 @@ Located spans: `<model>/spans.jsonl`.
 
 ## Results
 
-Copied from run artifacts.
+Copied from [`experiments/gemini_anchor_v2_test/results.md`](../experiments/gemini_anchor_v2_test/results.md),
+scored 2026-09-23. 19 test books, 2,337 gold spans, character-level IoU@0.5,
+greedy one-to-one. `gemini-3.8-flash` is not in this table: that cache never
+finished (3 window files). `gemini-3.5-flash-lite` is the arm that replaced it.
 
-### Three-model benchmark, test split (units)
+Stitch on and stitch off are the same number on every row. Locate already
+joins a gap of 0–5 characters before it writes `spans.jsonl`. The score-time
+stitch (gap ≤ 15, and only shad, tsheg, or spaces) then finds nothing left to
+join, so the predicted-span counts do not move.
 
-Source: [`experiments/gemini_anchor_v2_test/results.md`](../experiments/gemini_anchor_v2_test/results.md).
-19 books, 2,337 gold spans, character-level IoU@0.5, greedy one-to-one.
+### 16k windows (the comparable Gemini pair)
 
-| Model | Stitch | Precision | Recall | F1 |
-|---|---|---:|---:|---:|
-| gemini-3.1-flash-lite | on / off | 0.595 | 0.838 | **0.696** |
-| claude-sonnet-5 | on / off | 0.714 | 0.333 | 0.454 |
-| gemini-3.8-flash | — | — | — | not scored yet (no `spans.jsonl`) |
+Both Flash-Lite rows are `locate --source windows` (16,000 / 2,000). Same
+prompt, same gold, same matcher.
 
-Stitch on and stitch off produced the same P/R/F1 on both finished arms, so
-the adjacent-join rule did not move the headline on this run.
+| Model | Pred | Precision | Recall | F1 |
+|---|---:|---:|---:|---:|
+| gemini-3.1-flash-lite | 3,293 | 0.595 | 0.838 | **0.696** |
+| gemini-3.5-flash-lite | 3,701 | 0.530 | 0.839 | 0.649 |
 
-Flash-lite is the high-recall arm. Sonnet 5 is the high-precision arm and
-misses most of the gold. gemini-3.8-flash has raw dumps under
-`experiments/gemini_anchor_v2_test/gemini-3.8-flash/` but has not been located
-and scored; run `locate` then `score` when that cache is complete.
+Recall is the same. 3.5 emits more spans (3,701 vs 3,293) and precision drops,
+so F1 drops by about 0.05. Paired bootstrap over the 19 books, 10,000
+resamples, seed 42: 95% CI for F1(3.1) − F1(3.5) is **[0.012, 0.076]**. The
+interval does not include 0.
+
+### Claude, large units (not the same request size)
+
+| Model | Source | Pred | Precision | Recall | F1 |
+|---|---|---:|---:|---:|---:|
+| claude-sonnet-5 | 250k units (29 requests) | 1,090 | 0.714 | 0.333 | 0.454 |
+
+This 0.454 is the only Claude test score in the artifacts. Stitch on and
+stitch off both print it, and both count 1,090 predictions. There is no saved
+Claude run near 0.6.
+
+The 0.6-range numbers elsewhere on this page are other measurements:
+gemini-3.5-flash-lite window F1 **0.649**, gemini-3.1 precision **0.595**, and
+the validation size check (mean F1 0.654 on sparse units under 100K
+characters). None of those is a stitch-on Claude score.
+
+Claude is low because the batch was the large-unit path. `claude-batch` reads
+`units_test.jsonl` and has no `--source windows`. On Gemini, that same unit
+size is the weak setting: validation F1 0.359 overall, and 0.204 once a
+request is over 160K characters. The 16k windows are what lifted
+gemini-3.1-flash-lite to 0.696. Stitch cannot put back quotations the model
+never returned. A Claude number on the same 333 windows does not exist yet.
 
 **Not comparable to encoder 0.853.** That number is per-window token IoU
 against 2,299 gold pieces. These F1s are per-book character IoU against 2,337

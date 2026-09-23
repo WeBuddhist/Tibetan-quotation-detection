@@ -18,7 +18,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 # Direct imports
 from layer_detection.window_plan import make_windows, cut_points, _largest_cut_at_most
-from layer_detection.gemini_locate import locate_parsed_quote, parse_quote_dump, locate_span
+from layer_detection.gemini_locate import (
+    locate_parsed_quote,
+    locate_span,
+    parse_quote_dump,
+    quotes_from_items,
+)
 from layer_detection.v2_metrics import match_iou, inclusive_iou, muc_taxonomy, prf
 
 # Importlib shims for helper functions in scripts
@@ -38,6 +43,8 @@ read_usage = import_from_script("gemini_extract.py", "read_usage")
 stitch_adjacent_spans = import_from_script("check_gemini_quotes.py", "stitch_adjacent_spans")
 
 EXP_DIR = ROOT / "experiments" / "gemini_anchor_v2_test"
+
+GEMINI_MODELS = ("gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite")
 
 # Pricing and model metadata
 CLAUDE_INPUT_PRICE_PER_M = 1.0  # 50% batch discount of $2
@@ -355,8 +362,9 @@ def cmd_preflight(args):
     source = getattr(args, "source", "units")
     want_g2 = selected_model in (None, "gemini-3.8-flash")
     want_g1 = selected_model in (None, "gemini-3.1-flash-lite")
+    want_g35 = selected_model in (None, "gemini-3.5-flash-lite")
     want_claude = selected_model in (None, "claude-sonnet-5")
-    want_gemini = want_g2 or want_g1
+    want_gemini = want_g2 or want_g1 or want_g35
     # All-three preflight still treats Claude as optional. A Claude-only
     # --model run requires the Anthropic key.
     gemini_key, anthropic_key = check_api_keys(
@@ -396,6 +404,8 @@ def cmd_preflight(args):
         preflight_counts["gemini-3.8-flash"] = {}
     if want_g1:
         preflight_counts["gemini-3.1-flash-lite"] = {}
+    if want_g35:
+        preflight_counts["gemini-3.5-flash-lite"] = {}
     if anthropic_client:
         preflight_counts["claude-sonnet-5"] = {}
     
@@ -437,10 +447,13 @@ def cmd_preflight(args):
                 # Count tokens only for the selected model(s)
                 g2_tokens = 0
                 g1_tokens = 0
+                g35_tokens = 0
                 if want_g2:
                     g2_tokens = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
                 if want_g1:
                     g1_tokens = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
+                if want_g35:
+                    g35_tokens = count_gemini_tokens(gemini_client, "gemini-3.5-flash-lite", filled)
                 
                 c_tokens = 0
                 if anthropic_client:
@@ -453,10 +466,11 @@ def cmd_preflight(args):
                 # Fit checks: 170K Gemini, 1M - 64K Claude
                 is_g2_heavy = want_g2 and g2_tokens > 170_000
                 is_g1_heavy = want_g1 and g1_tokens > 170_000
+                is_g35_heavy = want_g35 and g35_tokens > 170_000
                 is_c_heavy = anthropic_client is not None and (c_tokens + 64_000) > 1_000_000
                 
-                if (is_g2_heavy or is_g1_heavy or is_c_heavy) and key not in ("windows_validation", "windows_test"):
-                    print(f"Preflight cut: Unit {bid} [{start}:{end}] is too large (G2:{g2_tokens}, G1:{g1_tokens}, C:{c_tokens}). Splitting in half...")
+                if (is_g2_heavy or is_g1_heavy or is_g35_heavy or is_c_heavy) and key not in ("windows_validation", "windows_test"):
+                    print(f"Preflight cut: Unit {bid} [{start}:{end}] is too large (G2:{g2_tokens}, G1:{g1_tokens}, G35:{g35_tokens}, C:{c_tokens}). Splitting in half...")
                     # Perform half-cut
                     cuts = cut_points(base_texts[bid])
                     mid_target = (start + end) // 2
@@ -516,6 +530,7 @@ def cmd_preflight(args):
         # Record final counted tokens
         g2_counts = {}
         g1_counts = {}
+        g35_counts = {}
         c_counts = {}
         for u in units:
             bid = u["book_id"]
@@ -530,6 +545,8 @@ def cmd_preflight(args):
                 g2_counts[ukey] = count_gemini_tokens(gemini_client, "gemini-3.8-flash", filled)
             if want_g1:
                 g1_counts[ukey] = count_gemini_tokens(gemini_client, "gemini-3.1-flash-lite", filled)
+            if want_g35:
+                g35_counts[ukey] = count_gemini_tokens(gemini_client, "gemini-3.5-flash-lite", filled)
             if anthropic_client:
                 c_resp = anthropic_client.messages.count_tokens(
                     model=c_api_model,
@@ -541,6 +558,8 @@ def cmd_preflight(args):
             preflight_counts["gemini-3.8-flash"][key] = g2_counts
         if want_g1:
             preflight_counts["gemini-3.1-flash-lite"][key] = g1_counts
+        if want_g35:
+            preflight_counts["gemini-3.5-flash-lite"][key] = g35_counts
         if anthropic_client:
             preflight_counts["claude-sonnet-5"][key] = c_counts
         
@@ -573,10 +592,12 @@ def cmd_preflight(args):
 
     total_g2_tokens = _sum_model_tokens("gemini-3.8-flash")
     total_g1_tokens = _sum_model_tokens("gemini-3.1-flash-lite")
+    total_g35_tokens = _sum_model_tokens("gemini-3.5-flash-lite")
     total_c_tokens = _sum_model_tokens("claude-sonnet-5") if anthropic_client else 0
     
     g2_rate = total_g2_tokens / total_chars if total_chars else 0
     g1_rate = total_g1_tokens / total_chars if total_chars else 0
+    g35_rate = total_g35_tokens / total_chars if total_chars else 0
     c_rate = total_c_tokens / total_chars if total_chars else 0
     
     print("\n" + "="*80)
@@ -588,6 +609,8 @@ def cmd_preflight(args):
         print(f"Gemini 3.8 Flash Rate:     {g2_rate:.4f} tokens/char (Total tokens: {total_g2_tokens:,})")
     if want_g1:
         print(f"Gemini 3.1 Flash Lite Rate: {g1_rate:.4f} tokens/char (Total tokens: {total_g1_tokens:,})")
+    if want_g35:
+        print(f"Gemini 3.5 Flash Lite Rate: {g35_rate:.4f} tokens/char (Total tokens: {total_g35_tokens:,})")
     if anthropic_client:
         print(f"Claude Sonnet 5 Rate:      {c_rate:.4f} tokens/char (Total tokens: {total_c_tokens:,})")
     print("-"*80)
@@ -607,6 +630,10 @@ def cmd_preflight(args):
         g1_rpd = limits.get("gemini-3.1-flash-lite", {}).get("rpd", 500)
         g1_days_test = test_units / (0.8 * g1_rpd) if g1_rpd else 0
         print(f"Gemini 3.1 Flash Lite: RPD limit = {g1_rpd} | Days needed = {g1_days_test:.2f}")
+    if want_g35:
+        g35_rpd = limits.get("gemini-3.5-flash-lite", {}).get("rpd", 500)
+        g35_days_test = test_units / (0.8 * g35_rpd) if g35_rpd else 0
+        print(f"Gemini 3.5 Flash Lite: RPD limit = {g35_rpd} | Days needed = {g35_days_test:.2f}")
     print("-"*80)
     
     if anthropic_client:
@@ -625,7 +652,7 @@ def cmd_preflight(args):
     print("\nRunning single-shot test call per selected model on a tiny window to verify credentials and thinking settings...")
     tiny_text = "ལུང་ལས། ཆོས་རྣམས་ཐམས་ཅད་བཀའ་དང་བསཏན་བཅོས་གཉིས་སུ་འདུས། །ཞེས་གསུངས་སོ། །"
     tiny_filled = fill_prompt_v2(template, tiny_text)
-    smoke_total = int(want_g2) + int(want_g1) + int(bool(anthropic_client))
+    smoke_total = int(want_g2) + int(want_g1) + int(want_g35) + int(bool(anthropic_client))
     smoke_i = 0
 
     if want_gemini:
@@ -678,6 +705,22 @@ def cmd_preflight(args):
             )
             print(f"  [{smoke_i}/{smoke_total}] Calling Gemini 3.1 Flash Lite ... ", end="", flush=True)
             gemini_client.models.generate_content(model="gemini-3.1-flash-lite", contents=tiny_filled, config=cfg_g1)
+            print("OK! Output parsed successfully.")
+        except Exception as e:
+            print(f"FAILED: {e}")
+
+    if want_g35:
+        smoke_i += 1
+        try:
+            cfg_g35 = types.GenerateContentConfig(
+                max_output_tokens=4096,
+                temperature=1.0,
+                response_mime_type="application/json",
+                response_schema=schema,
+                thinking_config=types.ThinkingConfig(thinking_level="low")
+            )
+            print(f"  [{smoke_i}/{smoke_total}] Calling Gemini 3.5 Flash Lite ... ", end="", flush=True)
+            gemini_client.models.generate_content(model="gemini-3.5-flash-lite", contents=tiny_filled, config=cfg_g35)
             print("OK! Output parsed successfully.")
         except Exception as e:
             print(f"FAILED: {e}")
@@ -796,7 +839,7 @@ def cmd_run(args):
     split = args.split
     source = getattr(args, "source", "units")
     
-    assert model in ["gemini-3.8-flash", "gemini-3.1-flash-lite"], f"Unknown Gemini model {model}"
+    assert model in GEMINI_MODELS, f"Unknown Gemini model {model}"
     assert split in ["test", "validation"], f"Unknown split {split}"
     
     gemini_key, _ = check_api_keys(require_gemini=True, require_anthropic=False)
@@ -1101,6 +1144,20 @@ def split_unit_in_half(u: dict, book_text: str) -> tuple[dict, dict]:
     }
     return p1, p2
 
+
+def expand_split_units(unit: dict, cache_dir: Path, book_text: str) -> list[dict]:
+    """Prefer mid-run child caches (``6_0`` / ``6_1``) over a truncated parent."""
+    piece = unit["piece"]
+    child0 = cache_dir / f"{piece}_0.json"
+    child1 = cache_dir / f"{piece}_1.json"
+    if child0.is_file() and child1.is_file():
+        half1, half2 = split_unit_in_half(unit, book_text)
+        expanded: list[dict] = []
+        for half in (half1, half2):
+            expanded.extend(expand_split_units(half, cache_dir, book_text))
+        return expanded
+    return [unit]
+
 # --------------------------------------------------------------------------- #
 # CLI Subcommand: claude-batch
 # --------------------------------------------------------------------------- #
@@ -1346,7 +1403,7 @@ def cmd_locate(args):
     split = args.split
     source = getattr(args, "source", "units")
     
-    assert model in ["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"], f"Unknown model {model}"
+    assert model in GEMINI_MODELS or model == "claude-sonnet-5", f"Unknown model {model}"
     assert split in ["test", "validation"], f"Unknown split {split}"
     
     # Load units to process
@@ -1366,8 +1423,20 @@ def cmd_locate(args):
     
     # Locate spans per unit/piece
     located_predictions = {} # book_id -> list of predictions
-    
+
+    work_units: list[dict] = []
     for u in units:
+        bid = u["book_id"]
+        cache_dir = model_dir / cache_sub_dir / bid
+        expanded = expand_split_units(u, cache_dir, base_texts[bid])
+        if len(expanded) > 1:
+            print(
+                f"Using split caches for {bid}__{u['piece']}: "
+                + ", ".join(f"{item['book_id']}__{item['piece']}" for item in expanded)
+            )
+        work_units.extend(expanded)
+
+    for u in work_units:
         bid = u["book_id"]
         piece = u["piece"]
         start = u["start"]
@@ -1386,8 +1455,20 @@ def cmd_locate(args):
         if not raw_text or cached.get("finish_reason") == "blocked":
             continue
             
-        # Parse dump
-        quotes = parse_quote_dump(raw_text)
+        # Parse dump. A MAX_TOKENS reply can cut the JSON mid-string; keep
+        # any complete span objects and skip the rest.
+        try:
+            quotes = parse_quote_dump(raw_text)
+        except json.JSONDecodeError as exc:
+            salvaged = salvage_spans(raw_text)
+            if not salvaged:
+                print(f"Unparseable JSON for unit {bid}__{piece} ({exc}); skipping")
+                continue
+            print(
+                f"Salvaged {len(salvaged)} complete span(s) from truncated JSON "
+                f"for unit {bid}__{piece}"
+            )
+            quotes = quotes_from_items(salvaged)
         
         # Locate
         # Since we must find them inside that unit's text, we forward cursor inside the unit
@@ -1653,8 +1734,8 @@ def cmd_score(args):
     books = load_gold_books(split)
     base_texts = {b["book_id"]: b["text"] for b in books}
     
-    # Load predictions for all three models if available
-    arms = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"]
+    # Load predictions for all models if available
+    arms = list(GEMINI_MODELS) + ["claude-sonnet-5"]
     spans_by_arm = {}
     
     for arm in arms:
@@ -1686,8 +1767,8 @@ def cmd_score(args):
         print(f"    P: {score_off['precision']:.4f} | R: {score_off['recall']:.4f} | F1: {score_off['f1']:.4f}  (Pred:{score_off['predicted']} / Gold:{score_off['gold']})")
         print("-"*80)
         
-    # Bootstrap paired bootstrap if test split and all three models have results
-    if split == "test" and len(spans_by_arm) == 3:
+    # Bootstrap paired bootstrap if test split and at least two models have results
+    if split == "test" and len(spans_by_arm) >= 2:
         print("Running paired bootstrap resamples (10,000 runs, fixed seed)...")
         # To perform paired bootstrap over 19 books:
         # We draw 10,000 resamples of the 19 books with replacement, calculate F1 differences, and report 95% CI.
@@ -1698,7 +1779,13 @@ def cmd_score(args):
         bootstrap_results = {}
         book_ids = list(base_texts.keys())
         
-        for arm_a, arm_b in [("gemini-3.8-flash", "gemini-3.1-flash-lite"), ("gemini-3.8-flash", "claude-sonnet-5"), ("gemini-3.1-flash-lite", "claude-sonnet-5")]:
+        available_arms = list(spans_by_arm.keys())
+        pairs = []
+        for i in range(len(available_arms)):
+            for j in range(i + 1, len(available_arms)):
+                pairs.append((available_arms[i], available_arms[j]))
+                
+        for arm_a, arm_b in pairs:
             diffs = []
             for _ in range(10000):
                 sample_bids = random.choices(book_ids, k=len(book_ids))
@@ -1758,6 +1845,7 @@ def cmd_freeze(args):
         "models": {
             "gemini-3.8-flash": {"temperature": 1.0, "thinking": "low"},
             "gemini-3.1-flash-lite": {"temperature": 1.0, "thinking": "low"},
+            "gemini-3.5-flash-lite": {"temperature": 1.0, "thinking": "low"},
             "claude-sonnet-5": {"thinking": "adaptive", "effort": "low"}
         },
         "freeze_time": int(time.time())
@@ -1782,13 +1870,13 @@ def main(argv: list[str] | None = None) -> int:
     preflight_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     preflight_parser.add_argument(
         "--model",
-        choices=["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"],
+        choices=list(GEMINI_MODELS) + ["claude-sonnet-5"],
         default=None,
-        help="Token-count and smoke-test only this model (default: all three)",
+        help="Token-count and smoke-test only this model (default: all models)",
     )
     
     run_parser = subparsers.add_parser("run", help="Run Gemini model processing")
-    run_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite"], help="Model ID")
+    run_parser.add_argument("--model", required=True, choices=list(GEMINI_MODELS), help="Model ID")
     run_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
     run_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     
@@ -1803,7 +1891,7 @@ def main(argv: list[str] | None = None) -> int:
     claude_parser.add_argument("--batch-id", default=None, help="Existing MessageBatch id for attach")
     
     locate_parser = subparsers.add_parser("locate", help="Locate predictions inside text")
-    locate_parser.add_argument("--model", required=True, choices=["gemini-3.8-flash", "gemini-3.1-flash-lite", "claude-sonnet-5"], help="Model")
+    locate_parser.add_argument("--model", required=True, choices=list(GEMINI_MODELS) + ["claude-sonnet-5"], help="Model")
     locate_parser.add_argument("--split", required=True, choices=["test", "validation"], help="Dataset split")
     locate_parser.add_argument("--source", choices=["units", "windows"], default="units", help="Data source type")
     

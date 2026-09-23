@@ -11,6 +11,7 @@ from layer_detection.gemini_locate import (
     locate_parsed_quote,
     locate_span,
     parse_quote_dump,
+    quotes_from_items,
     recover_offsets,
 )
 from layer_detection.v2_metrics import inclusive_iou, match_iou
@@ -129,6 +130,14 @@ class AnchorAndParseTests(unittest.TestCase):
         json_quotes = parse_quote_dump(as_json)
         self.assertEqual(json_quotes[0].label, "QUOTATION")
         self.assertEqual(json_quotes[0].text, "ཆོས་རྣམས།")
+
+    def test_quotes_from_items_keeps_head_tail_anchors(self):
+        quotes = quotes_from_items(
+            [{"label": "QUOTE", "head": "AAA", "tail": "ZZZ"}]
+        )
+        self.assertEqual(quotes[0].start_text, "AAA")
+        self.assertEqual(quotes[0].end_text, "ZZZ")
+        self.assertEqual(quotes[0].text, "")
 
     def test_locate_parsed_quote_prefers_full_text(self):
         hay = "frame XXX quoted words YYY closer"

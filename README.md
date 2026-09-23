@@ -139,10 +139,12 @@ python script/run_gemini_benchmark.py freeze
 
 python script/run_gemini_benchmark.py run --model gemini-3.8-flash --split test --source units
 python script/run_gemini_benchmark.py run --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py run --model gemini-3.5-flash-lite --split test --source units
 python script/run_gemini_benchmark.py claude-batch --action create --split test
 python script/run_gemini_benchmark.py claude-batch --action poll --split test
 
 python script/run_gemini_benchmark.py locate --model gemini-3.1-flash-lite --split test --source units
+python script/run_gemini_benchmark.py locate --model gemini-3.5-flash-lite --split test --source units
 python script/run_gemini_benchmark.py locate --model claude-sonnet-5 --split test --source units
 python script/run_gemini_benchmark.py score --split test
 ```

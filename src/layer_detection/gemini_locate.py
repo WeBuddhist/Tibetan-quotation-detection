@@ -218,9 +218,8 @@ def canonical_label(label: str) -> str:
     return LABEL_ALIASES.get(str(label).upper(), str(label).upper())
 
 
-def _parse_json_spans(raw: str) -> list[ParsedQuote]:
-    payload = json.loads(raw)
-    items = payload["spans"] if isinstance(payload, dict) else payload
+def quotes_from_items(items: Sequence) -> list[ParsedQuote]:
+    """Turn parsed JSON span objects into ``ParsedQuote`` rows."""
     quotes: list[ParsedQuote] = []
     for i, item in enumerate(items, start=1):
         if isinstance(item, str):
@@ -244,6 +243,12 @@ def _parse_json_spans(raw: str) -> list[ParsedQuote]:
             )
         )
     return quotes
+
+
+def _parse_json_spans(raw: str) -> list[ParsedQuote]:
+    payload = json.loads(raw)
+    items = payload["spans"] if isinstance(payload, dict) else payload
+    return quotes_from_items(items)
 
 
 def _parse_fields(block: str) -> dict[str, str]:
