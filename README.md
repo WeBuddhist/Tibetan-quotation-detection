@@ -175,3 +175,34 @@ repo fully standalone, replace the symlink with a real copy or re-run
 - `pip install -e .` is editable, so edits under `src/layer_detection/` take effect immediately.
 - Spans use inclusive ends throughout: `text[start:end+1]`, and `span_length = end - start + 1`.
 - Sliding-window overlap is context-only. Repeated stride-prefix tokens get label `-100` so they aren't counted twice.
+
+## Reviewed test set (human-checked gold)
+
+All 19 test books were reviewed span by span (accepted / edges corrected /
+removed / added). The review files go in `Data/review/quotation_test/`
+(`<book>-quotation.yaml`, one per book).
+
+```bash
+# build locally: book-level gold, BIOE test windows, change report (no network
+# if Data/quotation_windows_w8192_s4579_bioe/shards/test is on disk)
+python script/build_reviewed_benchmark.py
+
+# upload: new configs reviewed_test + windowed_w8192_s4579_bioe_reviewed, tag w2.1
+HF_TOKEN=... python script/build_reviewed_benchmark.py --push
+```
+
+The windows are the published w2.0 test windows with new labels — same input
+ids, offsets and ownership mask — and the build first checks that it can
+reproduce the published labels from the published gold before writing anything.
+
+Score a checkpoint on both golds in one model pass (GPU):
+
+```bash
+python script/eval_quotation_reviewed.py \
+    --config experiments/mmbert_quotation_v3/config.yaml \
+    --checkpoint karma689/tibetan-quotation-detection \
+    --save-logits outputs/reviewed_test_logits.npy
+```
+
+Add `--decode-from <eval_test.json>` to reuse a decode already chosen on
+validation and skip the validation pass. Output: `outputs/eval_reviewed_test.json`.
