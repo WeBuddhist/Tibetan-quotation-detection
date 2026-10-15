@@ -193,9 +193,15 @@ def owned_char_ranges(
     offset_mapping: Sequence[Sequence[int]],
 ) -> list[tuple[int, int]]:
     pairs = _offset_pairs(offset_mapping)
-    if len(pairs) < len(gold_ids):
+    # labels_matrix and the collator right-pad short windows to the batch width
+    # with -100. The parquet offset_mapping stays ragged, so a short tail is
+    # padding. A supervised label past the offset map is a real mismatch.
+    if len(pairs) < len(gold_ids) and any(
+        int(label) != -100 for label in gold_ids[len(pairs) :]
+    ):
         raise ValueError(
-            f"offset_mapping has {len(pairs)} rows but labels has {len(gold_ids)}"
+            f"offset_mapping has {len(pairs)} rows but labels has {len(gold_ids)} "
+            "with a supervised label past the offset map"
         )
     owned: list[tuple[int, int]] = []
     for label, (start, end) in zip(gold_ids, pairs, strict=False):
